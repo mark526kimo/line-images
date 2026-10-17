@@ -69,6 +69,22 @@
   .checks { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--text); }
   .checks .check { align-self: auto; min-height: 40px; }
   textarea.small { min-height: 72px; font: inherit; font-size: 15px; }
+  details.card > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; min-height: 28px; }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary::after { content: "▾"; margin-left: auto; color: var(--muted); }
+  details.card[open] > summary::after { content: "▴"; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+  .badge.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  input[type=password], input[list], #aiTopic {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px; width: 100%; min-height: 44px;
+  }
+  #aiStatus.error { color: var(--danger); }
+  #aiDiff { display: grid; gap: 6px; max-height: 260px; overflow-y: auto; font-size: 14px; }
+  #aiDiff:empty { display: none; }
+  #aiDiff div { padding: 6px 8px; border-radius: 8px; background: var(--bg); }
+  #aiDiff del { color: var(--muted); }
+  #aiDiff ins { text-decoration: none; color: var(--accent); font-weight: 600; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -130,6 +146,27 @@
     <p class="hint">第一次使用會下載模型（tiny 約 40 MB、base 約 80 MB、small 約 250 MB、large-v3-turbo 約 1 GB），之後存在裝置裡可離線使用，建議連 Wi‑Fi。large-v3-turbo 最準，適合在電腦的 Chrome／Edge 使用。字數上限填 0 為不切行。</p>
   </section>
 
+  <details class="card" id="aiCard">
+    <summary><strong>AI 校稿（Gemini）</strong><span class="badge" id="aiBadge">未設定</span></summary>
+    <p class="hint">辨識完後，把逐字稿（文字，不是錄音）交給 Google Gemini，依上下文修正聽錯的字和專有名詞。需要網路與你自己的 Gemini API 金鑰，依 Google 的計價收費。</p>
+    <label class="field">Gemini API 金鑰
+      <input id="aiKey" type="password" autocomplete="off" spellcheck="false" placeholder="貼上你的金鑰（AIza 開頭）">
+    </label>
+    <p class="hint">金鑰只存在這台裝置的瀏覽器裡，只會傳給 Google，不會上傳到 GitHub。金鑰可在 Google AI Studio 申請；不要把金鑰貼給別人或貼在公開的地方。</p>
+    <label class="field">模型
+      <input id="aiModel" list="aiModels" spellcheck="false" value="gemini-2.5-flash">
+      <datalist id="aiModels">
+        <option value="gemini-2.5-flash"></option>
+        <option value="gemini-2.5-pro"></option>
+        <option value="gemini-2.5-flash-lite"></option>
+      </datalist>
+    </label>
+    <label class="field">課程主題（選填，給 AI 參考）
+      <input id="aiTopic" spellcheck="false" placeholder="例如：高中生物 DNA 複製與轉錄">
+    </label>
+    <label class="check"><input id="aiAuto" type="checkbox" checked>轉換完自動 AI 校稿</label>
+  </details>
+
   <section class="card">
     <div class="row">
       <button id="startBtn" class="primary" type="button" disabled>開始轉換</button>
@@ -147,6 +184,12 @@
       <button id="dlBtn" class="primary" type="button">下載 SRT</button>
       <button id="shareBtn" type="button">分享</button>
     </div>
+    <div class="row">
+      <button id="aiBtn" type="button">AI 校稿</button>
+      <button id="undoAiBtn" type="button" hidden>復原 AI 校稿</button>
+    </div>
+    <div id="aiStatus" class="hint"></div>
+    <div id="aiDiff"></div>
   </section>
 </main>
 
@@ -234,6 +277,7 @@ self.onmessage = async ({ data }) => {
 const $ = (id) => document.getElementById(id);
 const SR = 16000;
 let currentFile = null, segments = [], worker = null, wakeLock = null;
+let currentPairs = [], currentTerms = [], currentKeywords = [];
 
 // ---------- SRT ----------
 function ts(sec) {
@@ -465,12 +509,171 @@ async function keepAwake(on) {
   } catch {}
 }
 
+// ---------- AI 校稿（Gemini） ----------
+const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
+const AI_BATCH = 60;      // 每次送出的字幕段數
+const AI_CONTEXT = 5;     // 附上前一批最後幾段當上下文
+let aiBackup = null, lastBuiltSrt = '';
+
+function aiKey() { return $('aiKey').value.trim(); }
+function setAiStatus(text, isError = false) { $('aiStatus').textContent = text; $('aiStatus').classList.toggle('error', isError); }
+function updateAiBadge() {
+  const on = !!aiKey();
+  $('aiBadge').textContent = on ? '已設定' : '未設定';
+  $('aiBadge').classList.toggle('on', on);
+}
+
+async function geminiFetch(path, body) {
+  const res = await fetch(`${GEMINI}/${path}`, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': aiKey() },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data.error && data.error.message || res.statusText;
+    if (res.status === 400 && /API key/i.test(msg)) throw new Error('API 金鑰無效，請檢查是否貼對。');
+    if (res.status === 403) throw new Error('這組金鑰沒有權限使用 Gemini API：' + msg);
+    if (res.status === 404) throw new Error(`找不到模型「${$('aiModel').value}」，請從模型清單另選一個。`);
+    if (res.status === 429) throw new Error('用量超過限制（免費額度或每分鐘上限），請稍後再試。');
+    throw new Error(`Gemini 錯誤 ${res.status}：${msg}`);
+  }
+  return data;
+}
+
+// 用金鑰取得可用的模型，填進下拉清單
+async function loadAiModels() {
+  if (!aiKey()) return;
+  try {
+    const data = await geminiFetch('models?pageSize=200');
+    const names = (data.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => m.name.replace(/^models\//, ''))
+      .filter((n) => /^gemini/.test(n) && !/embedding|tts|image|live|audio|vision/.test(n));
+    if (names.length) {
+      $('aiModels').innerHTML = names.map((n) => `<option value="${n}"></option>`).join('');
+      // 目前填的模型這組金鑰不能用時，自動換成可用的 flash 模型
+      if (!names.includes($('aiModel').value.trim())) {
+        $('aiModel').value = names.find((n) => /flash/.test(n) && !/lite|preview|exp/.test(n)) || names[0];
+      }
+    }
+  } catch (e) {
+    setAiStatus(e.message, true);
+  }
+}
+
+function aiPrompt() {
+  const topic = $('aiTopic').value.trim();
+  return [
+    '你是台灣的逐字稿校對員。輸入是語音辨識產生的上課字幕，每行有編號，可能有同音錯字、聽錯的專有名詞、簡體字或中國大陸用語。',
+    '請逐行修正：',
+    '1. 依上下文把聽錯的字、詞改成正確的，特別是生物、化學等專有名詞。',
+    '2. 一律使用台灣繁體中文與台灣課本用語（例如 粒線體、胺基酸、對偶基因、莫耳）。',
+    '3. 只改錯的地方，不要改寫語氣、不要潤飾、不要增刪內容、不要加標點以外的東西；口語贅字照留。',
+    '4. 不確定的地方保持原樣。英文術語（DNA、ATP 等）保持英文。',
+    '5. 行數與編號必須和輸入完全一樣，不可合併或拆開。「上下文」只是參考，不要輸出。',
+    topic ? `課程主題：${topic}` : '',
+    currentKeywords.length ? `可能出現的專有名詞：${currentKeywords.join('、')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function proofreadBatch(model, batch, context) {
+  const lines = batch.map((seg) => `${seg.id}|${seg.text}`).join('\n');
+  const ctx = context.length ? `上下文（不用輸出）：\n${context.map((s) => s.text).join('\n')}\n\n` : '';
+  const data = await geminiFetch(`models/${encodeURIComponent(model)}:generateContent`, {
+    systemInstruction: { parts: [{ text: aiPrompt() }] },
+    contents: [{ role: 'user', parts: [{ text: `${ctx}請校對以下字幕（格式：編號|文字）：\n${lines}` }] }],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'ARRAY',
+        items: { type: 'OBJECT', properties: { id: { type: 'INTEGER' }, text: { type: 'STRING' } }, required: ['id', 'text'] },
+      },
+    },
+  });
+  const cand = data.candidates && data.candidates[0];
+  if (!cand) throw new Error('Gemini 沒有回傳結果' + (data.promptFeedback ? `（${data.promptFeedback.blockReason || ''}）` : ''));
+  const text = ((cand.content && cand.content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+  let rows;
+  try { rows = JSON.parse(text); } catch { throw new Error('Gemini 回傳的格式看不懂，請再試一次。'); }
+  const out = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (Number.isInteger(r.id) && typeof r.text === 'string') out.set(r.id, r.text.trim());
+  }
+  return out;
+}
+
+// 防止 AI 改太多：長度差太多或變空白就保留原文
+function acceptAiLine(orig, fixed) {
+  if (!fixed) return false;
+  const a = [...orig].length, b = [...fixed].length;
+  return b >= a * 0.5 && b <= a * 1.6 + 4;
+}
+
+function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+async function proofread() {
+  if (!segments.length) return;
+  if (!aiKey()) { $('aiCard').open = true; setAiStatus('請先在上方「AI 校稿」填入 Gemini API 金鑰。', true); return; }
+  if ($('srt').value !== lastBuiltSrt && !confirm('AI 校稿會重新產生字幕，你在結果框裡手動改的內容會被蓋掉。要繼續嗎？')) return;
+  const model = $('aiModel').value.trim() || 'gemini-2.5-flash';
+  try { localStorage.setItem('aiModel', model); localStorage.setItem('aiTopic', $('aiTopic').value); } catch {}
+  $('aiBtn').disabled = true; $('startBtn').disabled = true;
+  const before = segments.map((s) => s.text);
+  const items = segments.map((s, i) => ({ id: i + 1, text: s.text }));
+  const changes = [];
+  try {
+    const total = Math.ceil(items.length / AI_BATCH);
+    for (let b = 0; b < total; b++) {
+      setAiStatus(`AI 校稿中… ${b + 1} / ${total}`);
+      const batch = items.slice(b * AI_BATCH, (b + 1) * AI_BATCH);
+      const context = items.slice(Math.max(0, b * AI_BATCH - AI_CONTEXT), b * AI_BATCH);
+      const fixed = await proofreadBatch(model, batch, context);
+      for (const it of batch) {
+        let t = fixed.get(it.id);
+        if (t === undefined || !acceptAiLine(it.text, t)) continue;
+        t = phoneticFix(applyCorrections(convert(t), currentPairs), currentTerms);
+        if (t !== it.text) { segments[it.id - 1].text = t; changes.push([it.id, it.text, t]); }
+      }
+    }
+    aiBackup = before;
+    $('srt').value = lastBuiltSrt = buildSrt();
+    $('undoAiBtn').hidden = !changes.length;
+    setAiStatus(changes.length ? `AI 校稿完成，修改了 ${changes.length} 段：` : 'AI 校稿完成，沒有需要修改的地方。');
+    $('aiDiff').innerHTML = changes.map(([id, a, b]) =>
+      `<div><del>${escapeHtml(a)}</del><br><ins>${escapeHtml(b)}</ins></div>`).join('');
+  } catch (e) {
+    // 失敗時保留已經改好的批次，沒改到的維持原樣
+    if (changes.length) { aiBackup = before; $('srt').value = lastBuiltSrt = buildSrt(); $('undoAiBtn').hidden = false; }
+    setAiStatus('AI 校稿失敗：' + (e.message || e) + (changes.length ? `（已修改 ${changes.length} 段）` : ''), true);
+  } finally {
+    $('aiBtn').disabled = false; $('startBtn').disabled = !currentFile;
+  }
+}
+
+$('aiBtn').addEventListener('click', proofread);
+$('aiAuto').addEventListener('change', () => { try { localStorage.setItem('aiAuto', $('aiAuto').checked ? '1' : '0'); } catch {} });
+$('undoAiBtn').addEventListener('click', () => {
+  if (!aiBackup) return;
+  aiBackup.forEach((t, i) => { if (segments[i]) segments[i].text = t; });
+  aiBackup = null;
+  $('srt').value = lastBuiltSrt = buildSrt();
+  $('undoAiBtn').hidden = true; $('aiDiff').innerHTML = '';
+  setAiStatus('已復原成 AI 校稿前的內容。');
+});
+$('aiKey').addEventListener('change', () => {
+  try { localStorage.setItem('aiKey', aiKey()); } catch {}
+  updateAiBadge();
+  loadAiModels();
+});
+
 function finish(msg, isError = false) {
   setRunning(false);
   keepAwake(false);
   if (worker) { worker.terminate(); worker = null; }
   setStatus(msg, isError);
-  if (segments.length) { $('srt').value = buildSrt(); $('resultCard').hidden = false; }
+  if (segments.length) { $('srt').value = lastBuiltSrt = buildSrt(); $('resultCard').hidden = false; }
 }
 
 $('startBtn').addEventListener('click', async () => {
@@ -486,7 +689,10 @@ $('startBtn').addEventListener('click', async () => {
   const glossaryText = await loadGlossaries(chosenGlossaries());
   const pairs = correctionPairs(glossaryText + '\n' + $('corr').value);
   // 自己的關鍵字排前面，同長度時優先
-  const terms = $('phonetic').checked ? phoneticTerms([...glossaryKeywords($('kw').value), ...glossaryKeywords(glossaryText)]) : [];
+  const keywords = [...glossaryKeywords($('kw').value), ...glossaryKeywords(glossaryText)];
+  const terms = $('phonetic').checked ? phoneticTerms(keywords) : [];
+  currentPairs = pairs; currentTerms = terms; currentKeywords = [...new Set(keywords)];
+  $('aiDiff').innerHTML = ''; $('aiStatus').textContent = ''; $('undoAiBtn').hidden = true;
   let lastRaw = '';
   setStatus('讀取音訊中…');
   let audio;
@@ -512,7 +718,10 @@ $('startBtn').addEventListener('click', async () => {
       const t = document.createElement('time'); t.textContent = ts(seg.start).slice(0, 8);
       div.append(t, seg.text);
       $('live').append(div); $('live').scrollTop = $('live').scrollHeight;
-    } else if (data.type === 'done') finish(segments.length ? `完成！共 ${segments.length} 段。` : '完成，但沒有辨識到語音。');
+    } else if (data.type === 'done') {
+      finish(segments.length ? `完成！共 ${segments.length} 段。` : '完成，但沒有辨識到語音。');
+      if (segments.length && $('aiAuto').checked && aiKey()) proofread();
+    }
     else if (data.type === 'error') finish('發生錯誤：' + data.text, true);
   };
   worker.onerror = (e) => finish('發生錯誤：' + (e.message || '無法啟動辨識'), true);
@@ -547,12 +756,19 @@ try {
   $('corr').value = localStorage.getItem('corrections') || '';
   $('kw').value = localStorage.getItem('keywords') || '';
   if (localStorage.getItem('phonetic') === '0') $('phonetic').checked = false;
+  $('aiKey').value = localStorage.getItem('aiKey') || '';
+  $('aiModel').value = localStorage.getItem('aiModel') || $('aiModel').value;
+  $('aiTopic').value = localStorage.getItem('aiTopic') || '';
+  if (localStorage.getItem('aiAuto') === '0') $('aiAuto').checked = false;
   const g = localStorage.getItem('glossaries');
   if (g !== null) {
     const set = new Set(g.split(','));
     document.querySelectorAll('#glossaries input').forEach((el) => { el.checked = set.has(el.value); });
   }
 } catch {}
+
+updateAiBadge();
+if (aiKey()) loadAiModels();
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
