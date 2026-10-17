@@ -250,6 +250,139 @@ def decode_audio(path, sampling_rate=16000):
     return np.frombuffer(raw.getbuffer(), dtype=np.int16).astype(np.float32) / 32768.0
 
 
+# ---------- AI 校稿（Gemini） ----------
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+AI_MODELS = ["gemini-3.6-flash", "gemini-3.6-flash-lite", "gemini-3.8-flash"]  # 預設選項，依序優先
+AI_BATCH = 60    # 每次送出的字幕段數
+AI_CONTEXT = 5   # 附上前一批最後幾段當上下文
+
+
+def gemini_request(key, path, body=None):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        f"{GEMINI_URL}/{path}",
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        method="POST" if body is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as res:
+            return json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except ValueError:
+            msg = e.reason
+        if e.code == 400 and "API key" in msg:
+            raise RuntimeError("Gemini API 金鑰無效，請檢查是否貼對。") from None
+        if e.code == 403:
+            raise RuntimeError(f"這組金鑰沒有權限使用 Gemini API：{msg}") from None
+        if e.code == 404:
+            raise RuntimeError(f"找不到 Gemini 模型：{msg}") from None
+        if e.code == 429:
+            raise RuntimeError("Gemini 用量超過限制（免費額度或每分鐘上限），請稍後再試。") from None
+        raise RuntimeError(f"Gemini 錯誤 {e.code}：{msg}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"連不上 Gemini，請檢查網路：{e.reason}") from None
+
+
+def resolve_ai_model(key, wanted, log=print):
+    """確認模型能用；不能用時依 AI_MODELS 順序換一個可用的。"""
+    try:
+        data = gemini_request(key, "models?pageSize=200")
+    except RuntimeError:
+        raise
+    names = [m["name"].split("/", 1)[-1] for m in data.get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    names = [n for n in names if n.startswith("gemini")]
+    if not names or wanted in names:
+        return wanted
+    for m in AI_MODELS:
+        hit = next((n for n in names if n == m or n.startswith(m + "-")), None)
+        if hit:
+            log(f"模型 {wanted} 不能用，改用 {hit}。")
+            return hit
+    hit = next((n for n in names if "flash" in n and "lite" not in n), names[0])
+    log(f"模型 {wanted} 不能用，改用 {hit}。")
+    return hit
+
+
+def ai_prompt(topic, keywords):
+    lines = [
+        "你是台灣的逐字稿校對員。輸入是語音辨識產生的上課字幕，每行有編號，可能有同音錯字、聽錯的專有名詞、簡體字或中國大陸用語。",
+        "請逐行修正：",
+        "1. 依上下文把聽錯的字、詞改成正確的，特別是生物、化學等專有名詞。",
+        "2. 一律使用台灣繁體中文與台灣課本用語（例如 粒線體、胺基酸、對偶基因、莫耳）。",
+        "3. 只改錯的地方，不要改寫語氣、不要潤飾、不要增刪內容、不要加標點以外的東西；口語贅字照留。",
+        "4. 不確定的地方保持原樣。英文術語（DNA、ATP 等）保持英文。",
+        "5. 行數與編號必須和輸入完全一樣，不可合併或拆開。「上下文」只是參考，不要輸出。",
+    ]
+    if topic:
+        lines.append(f"課程主題：{topic}")
+    if keywords:
+        lines.append("可能出現的專有名詞：" + "、".join(keywords))
+    return "\n".join(lines)
+
+
+def accept_ai_line(orig, fixed):
+    """防止 AI 改太多：長度差太多或變空白就保留原文。"""
+    return bool(fixed) and len(orig) * 0.5 <= len(fixed) <= len(orig) * 1.6 + 4
+
+
+def ai_proofread(texts, key, model, topic="", keywords=(), log=print, postprocess=lambda t: t):
+    """回傳 (校稿後的文字清單, 修改清單 [(序號, 原文, 新文)])。失敗時拋出例外，已完成的批次寫在 e.partial。"""
+    system = ai_prompt(topic, list(keywords))
+    out = list(texts)
+    changes = []
+    total = (len(texts) + AI_BATCH - 1) // AI_BATCH
+    try:
+        for b in range(total):
+            log(f"AI 校稿中… {b + 1} / {total}")
+            lo, hi = b * AI_BATCH, min((b + 1) * AI_BATCH, len(texts))
+            context = texts[max(0, lo - AI_CONTEXT):lo]
+            prompt = ""
+            if context:
+                prompt += "上下文（不用輸出）：\n" + "\n".join(context) + "\n\n"
+            prompt += "請校對以下字幕（格式：編號|文字）：\n" + "\n".join(f"{i + 1}|{texts[i]}" for i in range(lo, hi))
+            data = gemini_request(key, f"models/{model}:generateContent", {
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "responseMimeType": "application/json",
+                    "responseSchema": {
+                        "type": "ARRAY",
+                        "items": {"type": "OBJECT",
+                                  "properties": {"id": {"type": "INTEGER"}, "text": {"type": "STRING"}},
+                                  "required": ["id", "text"]},
+                    },
+                },
+            })
+            cands = data.get("candidates") or []
+            if not cands:
+                raise RuntimeError("Gemini 沒有回傳結果")
+            raw = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []) if not p.get("thought"))
+            try:
+                rows = json.loads(raw)
+            except ValueError:
+                raise RuntimeError("Gemini 回傳的格式看不懂，請再試一次。") from None
+            fixed = {r["id"]: r["text"].strip() for r in rows if isinstance(r, dict)
+                     and isinstance(r.get("id"), int) and isinstance(r.get("text"), str)}
+            for i in range(lo, hi):
+                t = fixed.get(i + 1)
+                if t is None or not accept_ai_line(texts[i], t):
+                    continue
+                t = postprocess(t)
+                if t != texts[i]:
+                    out[i] = t
+                    changes.append((i + 1, texts[i], t))
+    except RuntimeError as e:
+        e.partial = (out, changes)
+        raise
+    return out, changes
+
+
 _model_cache = {}
 
 
@@ -268,8 +401,11 @@ def load_model(name, device="auto"):
 
 def transcribe_to_srt(path, model_name="small", language=None, traditional=False,
                       max_chars=0, output=None, log=print, progress=None, stop_event=None,
-                      keywords="", corrections="", glossary=None, phonetic=True):
-    """轉換單一檔案，回傳輸出的 srt 路徑。"""
+                      keywords="", corrections="", glossary=None, phonetic=True, ai=None):
+    """轉換單一檔案，回傳輸出的 srt 路徑。
+
+    ai：要 AI 校稿時傳 {"key": 金鑰, "model": 模型, "topic": 課程主題}。
+    """
     if os.path.splitext(path)[1].lower() in NOT_MEDIA:
         raise RuntimeError(f"這不是音訊或影片檔：{os.path.basename(path)}")
     log(f"讀取聲音：{os.path.basename(path)}")
@@ -331,31 +467,55 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
 
     duration = info.duration or 0
     output = output or os.path.splitext(path)[0] + ".srt"
-    index = 1
     prev_text = ""
     skipped = 0
-    with open(output, "w", encoding="utf-8") as f:
-        for seg in segments:
-            if stop_event is not None and stop_event.is_set():
-                log("已取消。")
-                break
-            if is_hallucination(seg, prev_text):
-                skipped += 1
-                continue
-            prev_text = seg.text.strip()
-            text = phonetic_fix(apply_corrections(convert(seg.text), pairs), terms)
-            for start, end, line in split_long_segment(text, seg.start, seg.end, max_chars):
-                if not line:
-                    continue
-                f.write(f"{index}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{line}\n\n")
-                index += 1
-            log(f"[{format_timestamp(seg.start)}] {text.strip()}")
-            if progress and duration:
-                progress(min(seg.end / duration, 1.0))
+    cancelled = False
+    items = []  # [開始, 結束, 文字]
+    for seg in segments:
+        if stop_event is not None and stop_event.is_set():
+            log("已取消。")
+            cancelled = True
+            break
+        if is_hallucination(seg, prev_text):
+            skipped += 1
+            continue
+        prev_text = seg.text.strip()
+        text = phonetic_fix(apply_corrections(convert(seg.text), pairs), terms).strip()
+        if text:
+            items.append([seg.start, seg.end, text])
+        log(f"[{format_timestamp(seg.start)}] {text}")
+        if progress and duration:
+            progress(min(seg.end / duration, 1.0))
     if progress:
         progress(1.0)
     if skipped:
         log(f"已略過 {skipped} 段疑似幻覺／重複的內容。")
+
+    if ai and ai.get("key") and items and not cancelled:
+        texts = [t for _, _, t in items]
+        postprocess = lambda t: phonetic_fix(apply_corrections(convert(t), pairs), terms)
+        try:
+            model = resolve_ai_model(ai["key"], ai.get("model") or AI_MODELS[0], log)
+            new, changes = ai_proofread(texts, ai["key"], model, ai.get("topic", ""), keyword_list, log, postprocess)
+        except RuntimeError as e:
+            new, changes = getattr(e, "partial", (texts, []))
+            msg = str(e).rstrip("。")
+            log(f"AI 校稿失敗：{msg}" + (f"（已修改 {len(changes)} 段）" if changes else "，輸出未校稿的版本。"))
+        else:
+            log(f"AI 校稿完成，修改了 {len(changes)} 段。" if changes else "AI 校稿完成，沒有需要修改的地方。")
+        for n, old, fixed in changes:
+            log(f"  {old}\n  → {fixed}")
+        for item, t in zip(items, new):
+            item[2] = t
+
+    index = 1
+    with open(output, "w", encoding="utf-8") as f:
+        for start, end, text in items:
+            for a, b, line in split_long_segment(text, start, end, max_chars):
+                if not line:
+                    continue
+                f.write(f"{index}\n{format_timestamp(a)} --> {format_timestamp(b)}\n{line}\n\n")
+                index += 1
     log(f"完成！已輸出：{output}")
     return output
 
@@ -372,8 +532,18 @@ def run_cli(argv):
     p.add_argument("-k", "--keywords", default="", help="人名、專有名詞等關鍵字，用逗號分隔，可提高這些詞的準確度")
     p.add_argument("-g", "--glossary", help="專業詞庫：biology（生物學）、chemistry（化學）或詞庫檔路徑，多個用逗號分隔")
     p.add_argument("-c", "--corrections", help="自動更正清單檔，每行一組「錯字=正確」")
+    p.add_argument("--ai", action="store_true", help="辨識完用 Gemini AI 校稿（金鑰放在環境變數 GEMINI_API_KEY，或先在視窗版設定）")
+    p.add_argument("--ai-model", default=None, help=f"Gemini 模型（預設 {AI_MODELS[0]}）")
+    p.add_argument("--topic", default="", help="課程主題，給 AI 校稿參考")
     p.add_argument("-o", "--output", help="輸出檔名（僅限單一輸入檔）")
     args = p.parse_args(argv)
+    ai = None
+    if args.ai:
+        settings = load_settings()
+        key = os.environ.get("GEMINI_API_KEY") or settings.get("ai_key", "")
+        if not key:
+            p.error("要用 --ai 請先設定環境變數 GEMINI_API_KEY，或在視窗版填入金鑰")
+        ai = {"key": key, "model": args.ai_model or settings.get("ai_model") or AI_MODELS[0], "topic": args.topic}
     if args.output and len(args.files) > 1:
         p.error("-o 只能搭配單一輸入檔")
     corrections = ""
@@ -390,7 +560,7 @@ def run_cli(argv):
     for path in args.files:
         transcribe_to_srt(path, args.model, args.language, args.traditional,
                           args.max_chars, args.output,
-                          keywords=args.keywords, corrections=corrections, glossary=glossary)
+                          keywords=args.keywords, corrections=corrections, glossary=glossary, ai=ai)
 
 
 # ---------------------------------------------------------------- 圖形介面
@@ -420,7 +590,7 @@ def run_gui():
 
     root = tk.Tk()
     root.title("語音轉 SRT 字幕")
-    root.geometry("760x700")
+    root.geometry("780x860")
 
     files = []
     stop_event = threading.Event()
@@ -530,6 +700,25 @@ def run_gui():
               foreground="gray").grid(row=6, column=1, columnspan=2, sticky="w")
     opts.columnconfigure(2, weight=1)
 
+    # AI 校稿
+    ai_frame = ttk.LabelFrame(frm, text="AI 校稿（Gemini）", padding=8)
+    ai_frame.pack(fill="x", pady=(0, 6))
+    ai_on_var = tk.BooleanVar(value=settings.get("ai_on", False))
+    ttk.Checkbutton(ai_frame, text="辨識完用 Gemini 依上下文修正錯字（需要網路，只傳文字不傳錄音）",
+                    variable=ai_on_var).grid(row=0, column=0, columnspan=3, sticky="w")
+    ttk.Label(ai_frame, text="API 金鑰：").grid(row=1, column=0, sticky="w", pady=4)
+    ai_key_var = tk.StringVar(value=settings.get("ai_key", ""))
+    ttk.Entry(ai_frame, textvariable=ai_key_var, show="*", width=44).grid(row=1, column=1, sticky="we")
+    ttk.Label(ai_frame, text="模型：").grid(row=2, column=0, sticky="w")
+    ai_model_var = tk.StringVar(value=settings.get("ai_model", AI_MODELS[0]))
+    ttk.Combobox(ai_frame, textvariable=ai_model_var, values=AI_MODELS, width=24).grid(row=2, column=1, sticky="w")
+    ttk.Label(ai_frame, text="課程主題：").grid(row=3, column=0, sticky="w", pady=4)
+    ai_topic_var = tk.StringVar(value=settings.get("ai_topic", ""))
+    ttk.Entry(ai_frame, textvariable=ai_topic_var).grid(row=3, column=1, columnspan=2, sticky="we")
+    ttk.Label(ai_frame, text="金鑰到 Google AI Studio 申請；只存在這台電腦，不要分享給別人。",
+              foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w")
+    ai_frame.columnconfigure(1, weight=1)
+
     # 進度與紀錄
     progress = ttk.Progressbar(frm, maximum=1.0)
     progress.pack(fill="x", pady=4)
@@ -555,7 +744,7 @@ def run_gui():
     def set_progress(v):
         root.after(0, lambda: progress.configure(value=v))
 
-    def worker(job_files, model, lang, trad, max_chars, keywords, corrections, glossary):
+    def worker(job_files, model, lang, trad, max_chars, keywords, corrections, glossary, ai):
         failed = []
         try:
             for i, path in enumerate(job_files, 1):
@@ -566,7 +755,7 @@ def run_gui():
                 try:
                     transcribe_to_srt(path, model, lang, trad, max_chars,
                                       log=log, progress=set_progress, stop_event=stop_event,
-                                      keywords=keywords, corrections=corrections, glossary=glossary)
+                                      keywords=keywords, corrections=corrections, glossary=glossary, ai=ai)
                 except Exception as e:  # 一個檔案失敗，繼續轉下一個
                     log(f"錯誤：{e}")
                     failed.append(f"{os.path.basename(path)}：{e}")
@@ -591,14 +780,21 @@ def run_gui():
         keywords = kw_var.get()
         corrections = corr_box.get("1.0", "end").strip()
         chosen = [name for name, var in gl_vars.items() if var.get()]
-        save_settings({"keywords": keywords, "corrections": corrections, "glossary": chosen})
+        ai_key = ai_key_var.get().strip()
+        if ai_on_var.get() and not ai_key:
+            messagebox.showwarning("提醒", "要用 AI 校稿，請先填入 Gemini API 金鑰，或取消勾選 AI 校稿。")
+            return
+        ai = {"key": ai_key, "model": ai_model_var.get().strip(), "topic": ai_topic_var.get().strip()} if ai_on_var.get() else None
+        save_settings({"keywords": keywords, "corrections": corrections, "glossary": chosen,
+                       "ai_on": ai_on_var.get(), "ai_key": ai_key,
+                       "ai_model": ai_model_var.get().strip(), "ai_topic": ai_topic_var.get().strip()})
         stop_event.clear()
         start_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
         threading.Thread(
             target=worker,
             args=(list(files), model_var.get(), LANGUAGES[lang_var.get()], trad_var.get(), max_chars,
-                  keywords, corrections, [glossaries[n] for n in chosen]),
+                  keywords, corrections, [glossaries[n] for n in chosen], ai),
             daemon=True,
         ).start()
 
