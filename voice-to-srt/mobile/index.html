@@ -65,6 +65,9 @@
     width: 100%; min-height: 220px; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
     color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
   }
+  div.field { display: grid; gap: 4px; font-size: 14px; color: var(--muted); }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--text); }
+  .checks .check { align-self: auto; min-height: 40px; }
   textarea.small { min-height: 72px; font: inherit; font-size: 15px; }
   [hidden] { display: none !important; }
 </style>
@@ -111,12 +114,12 @@
       </label>
       <label class="check"><input id="trad" type="checkbox" checked>轉繁體</label>
     </div>
-    <label class="field">專業詞庫
-      <select id="glossary">
-        <option value="">無</option>
-        <option value="biology" selected>生物學</option>
-      </select>
-    </label>
+    <div class="field">專業詞庫（可複選）
+      <div class="checks" id="glossaries">
+        <label class="check"><input type="checkbox" value="biology" checked>生物學</label>
+        <label class="check"><input type="checkbox" value="chemistry">化學</label>
+      </div>
+    </div>
     <label class="field">自己的關鍵字（人名、專有名詞，用逗號或換行分隔）
       <textarea id="kw" class="small" spellcheck="false" placeholder="磷酸根, 草履蟲, 陳老師"></textarea>
     </label>
@@ -272,6 +275,12 @@ function setupConverter() {
 }
 
 // 自動更正：錯字也經過繁簡轉換一次，才對得上轉換後的文字（例如「台」被轉成「臺」）
+function chosenGlossaries() {
+  return [...document.querySelectorAll('#glossaries input:checked')].map((el) => el.value);
+}
+async function loadGlossaries(names) {
+  return (await Promise.all(names.map(loadGlossary))).join('\n');
+}
 async function loadGlossary(name) {
   if (!name) return '';
   try {
@@ -470,11 +479,11 @@ $('startBtn').addEventListener('click', async () => {
   setRunning(true); keepAwake(true); setupConverter();
   try {
     localStorage.setItem('corrections', $('corr').value);
-    localStorage.setItem('glossary', $('glossary').value);
+    localStorage.setItem('glossaries', chosenGlossaries().join(','));
     localStorage.setItem('keywords', $('kw').value);
     localStorage.setItem('phonetic', $('phonetic').checked ? '1' : '0');
   } catch {}
-  const glossaryText = await loadGlossary($('glossary').value);
+  const glossaryText = await loadGlossaries(chosenGlossaries());
   const pairs = correctionPairs(glossaryText + '\n' + $('corr').value);
   // 自己的關鍵字排前面，同長度時優先
   const terms = $('phonetic').checked ? phoneticTerms([...glossaryKeywords($('kw').value), ...glossaryKeywords(glossaryText)]) : [];
@@ -538,8 +547,11 @@ try {
   $('corr').value = localStorage.getItem('corrections') || '';
   $('kw').value = localStorage.getItem('keywords') || '';
   if (localStorage.getItem('phonetic') === '0') $('phonetic').checked = false;
-  const g = localStorage.getItem('glossary');
-  if (g !== null) $('glossary').value = g;
+  const g = localStorage.getItem('glossaries');
+  if (g !== null) {
+    const set = new Set(g.split(','));
+    document.querySelectorAll('#glossaries input').forEach((el) => { el.checked = set.has(el.value); });
+  }
 } catch {}
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});

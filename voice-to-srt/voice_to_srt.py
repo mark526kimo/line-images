@@ -90,7 +90,7 @@ def parse_corrections(text):
 
 
 GLOSSARY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossaries")
-GLOSSARY_NAMES = {"biology": "生物學"}
+GLOSSARY_NAMES = {"biology": "生物學", "chemistry": "化學"}
 MAX_KEYWORD_CHARS = 150  # Whisper 的提示長度有限，太長前面會被截掉
 
 
@@ -242,11 +242,13 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     convert = make_converter(traditional)
 
     keyword_list = [k.strip() for k in re.split(r"[,，、\n]", keywords or "") if k.strip()]
-    if glossary:
-        g_keywords, g_corrections = read_glossary(glossary)
+    if isinstance(glossary, str):
+        glossary = [glossary]
+    for path in glossary or []:
+        g_keywords, g_corrections = read_glossary(path)
         keyword_list += [k for k in g_keywords if k not in keyword_list]
-        corrections = g_corrections + "\n" + (corrections or "")  # 自己的更正放後面，優先度較高
-        log(f"使用詞庫：{os.path.basename(glossary)}")
+        corrections = g_corrections + "\n" + (corrections or "")
+        log(f"使用詞庫：{os.path.basename(path)}")
 
     # 長的錯字先換，避免「淋巴細胞」被「細胞」之類的短規則先換掉
     pairs = sorted(parse_corrections(corrections), key=lambda p: -len(p[0]))
@@ -328,7 +330,7 @@ def run_cli(argv):
     p.add_argument("-t", "--traditional", action="store_true", help="中文輸出轉為繁體（台灣用語）")
     p.add_argument("--max-chars", type=int, default=0, help="每行字幕最多字數，0 為不切")
     p.add_argument("-k", "--keywords", default="", help="人名、專有名詞等關鍵字，用逗號分隔，可提高這些詞的準確度")
-    p.add_argument("-g", "--glossary", help="專業詞庫：biology（生物學）或詞庫檔路徑")
+    p.add_argument("-g", "--glossary", help="專業詞庫：biology（生物學）、chemistry（化學）或詞庫檔路徑，多個用逗號分隔")
     p.add_argument("-c", "--corrections", help="自動更正清單檔，每行一組「錯字=正確」")
     p.add_argument("-o", "--output", help="輸出檔名（僅限單一輸入檔）")
     args = p.parse_args(argv)
@@ -338,11 +340,13 @@ def run_cli(argv):
     if args.corrections:
         with open(args.corrections, encoding="utf-8") as f:
             corrections = f.read()
-    glossary = args.glossary
-    if glossary and not os.path.isfile(glossary):
-        glossary = os.path.join(GLOSSARY_DIR, glossary + ".txt")
-        if not os.path.isfile(glossary):
-            p.error(f"找不到詞庫：{args.glossary}")
+    glossary = []
+    for g in filter(None, (args.glossary or "").split(",")):
+        g = g.strip()
+        path = g if os.path.isfile(g) else os.path.join(GLOSSARY_DIR, g + ".txt")
+        if not os.path.isfile(path):
+            p.error(f"找不到詞庫：{g}")
+        glossary.append(path)
     for path in args.files:
         transcribe_to_srt(path, args.model, args.language, args.traditional,
                           args.max_chars, args.output,
@@ -426,21 +430,33 @@ def run_gui():
     ttk.Label(opts, text="0 = 不切行", foreground="gray").grid(row=2, column=2, sticky="w", padx=8)
 
     settings = load_settings()
-    glossaries = {"無": None, **list_glossaries()}
+    glossaries = list_glossaries()
+    saved = settings.get("glossary", ["生物學"])
+    if isinstance(saved, str):  # 舊版設定只存一個
+        saved = [saved]
     ttk.Label(opts, text="專業詞庫：").grid(row=7, column=0, sticky="w", pady=4)
     gl_row = ttk.Frame(opts)
     gl_row.grid(row=7, column=1, columnspan=2, sticky="w")
-    gl_var = tk.StringVar(value=settings.get("glossary", "無") if settings.get("glossary") in glossaries else "無")
-    gl_combo = ttk.Combobox(gl_row, textvariable=gl_var, values=list(glossaries), state="readonly", width=14)
-    gl_combo.pack(side="left")
+    gl_vars = {}
+    gl_checks = ttk.Frame(gl_row)
+    gl_checks.pack(side="left")
+
+    def add_glossary_check(name, checked):
+        gl_vars[name] = tk.BooleanVar(value=checked)
+        ttk.Checkbutton(gl_checks, text=name, variable=gl_vars[name]).pack(side="left", padx=(0, 6))
+
+    for name in glossaries:
+        add_glossary_check(name, name in saved)
 
     def load_glossary_file():
         p = filedialog.askopenfilename(title="選擇詞庫檔", filetypes=[("詞庫", "*.txt")])
         if p:
             name = os.path.splitext(os.path.basename(p))[0]
+            if name in gl_vars:
+                gl_vars[name].set(True)
+            else:
+                add_glossary_check(name, True)
             glossaries[name] = p
-            gl_combo.configure(values=list(glossaries))
-            gl_var.set(name)
 
     def open_glossary_dir():
         os.makedirs(GLOSSARY_DIR, exist_ok=True)
@@ -520,14 +536,15 @@ def run_gui():
             max_chars = 0
         keywords = kw_var.get()
         corrections = corr_box.get("1.0", "end").strip()
-        save_settings({"keywords": keywords, "corrections": corrections, "glossary": gl_var.get()})
+        chosen = [name for name, var in gl_vars.items() if var.get()]
+        save_settings({"keywords": keywords, "corrections": corrections, "glossary": chosen})
         stop_event.clear()
         start_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
         threading.Thread(
             target=worker,
             args=(list(files), model_var.get(), LANGUAGES[lang_var.get()], trad_var.get(), max_chars,
-                  keywords, corrections, glossaries.get(gl_var.get())),
+                  keywords, corrections, [glossaries[n] for n in chosen]),
             daemon=True,
         ).start()
 
