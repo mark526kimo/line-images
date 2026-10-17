@@ -39,7 +39,7 @@ python voice_to_srt.py a.mp3 b.mp3 c.mp3                # 一次轉多個
 | `-c` | 自動更正清單檔（每行「錯字=正確」） |
 | `--max-chars` | 每行字幕最多字數，過長會自動拆行並分配時間 |
 | `--ai` | 辨識完用 Gemini AI 校稿（金鑰放環境變數 `GEMINI_API_KEY`） |
-| `--ai-model` | Gemini 模型，預設 `gemini-3.6-flash` |
+| `--ai-model` | Gemini 模型，預設 `gemini-3.5-flash-lite` |
 | `--topic` | 課程主題，給 AI 校稿參考 |
 | `-o` | 指定輸出檔名（單一檔案時） |
 
@@ -56,7 +56,7 @@ python voice_to_srt.py a.mp3 b.mp3 c.mp3                # 一次轉多個
    - 到 Google AI Studio 申請自己的 Gemini API 金鑰
    - 網頁版：展開「AI 校稿（Gemini）」貼上金鑰；金鑰只存在你裝置的瀏覽器
    - 電腦版：勾選「AI 校稿」並貼上金鑰；金鑰存在這台電腦的 `~/.voice_to_srt.json`。命令列用 `--ai`（金鑰放環境變數 `GEMINI_API_KEY`）
-   - 模型預設 gemini-3.6-flash，也可選 3.6 flash lite、3.8 flash；選的模型不能用時會自動換成可用的
+   - 模型預設 gemini-3.5-flash-lite，也可選 3.6 flash、3.6 flash lite、3.8 flash；選的模型不能用或一直忙碌（503）時，會等一下重試，再依這個順序自動換
    - 金鑰不會上傳到 GitHub；**不要把金鑰寫進程式資料夾裡的檔案或貼在公開的地方**
    - 只傳文字、不傳錄音；改了哪些地方會列出來，不滿意可以按「復原 AI 校稿」
    - AI 改動太大（長度差很多）的行會自動保留原文，避免 AI 亂加內容

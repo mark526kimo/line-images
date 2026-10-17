@@ -254,7 +254,8 @@ def decode_audio(path, sampling_rate=16000):
 
 # ---------- AI 校稿（Gemini） ----------
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
-AI_MODELS = ["gemini-3.6-flash", "gemini-3.6-flash-lite", "gemini-3.8-flash"]  # 預設選項，依序優先
+AI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.6-flash-lite", "gemini-3.8-flash"]  # 預設選項，依序優先
+AI_SETTINGS_VERSION = 2  # 預設模型改過時加一，讓舊設定換成新預設
 AI_BATCH = 60    # 每次送出的字幕段數
 AI_CONTEXT = 5   # 附上前一批最後幾段當上下文
 AI_RETRY_CODES = {429, 500, 502, 503, 504}  # 忙碌、暫時性錯誤：等一下重試
@@ -579,7 +580,8 @@ def run_cli(argv):
         key = os.environ.get("GEMINI_API_KEY") or settings.get("ai_key", "")
         if not key:
             p.error("要用 --ai 請先設定環境變數 GEMINI_API_KEY，或在視窗版填入金鑰")
-        ai = {"key": key, "model": args.ai_model or settings.get("ai_model") or AI_MODELS[0], "topic": args.topic}
+        saved_model = settings.get("ai_model") if settings.get("ai_model_v") == AI_SETTINGS_VERSION else None
+        ai = {"key": key, "model": args.ai_model or saved_model or AI_MODELS[0], "topic": args.topic}
     if args.output and len(args.files) > 1:
         p.error("-o 只能搭配單一輸入檔")
     corrections = ""
@@ -746,7 +748,8 @@ def run_gui():
     ai_key_var = tk.StringVar(value=settings.get("ai_key", ""))
     ttk.Entry(ai_frame, textvariable=ai_key_var, show="*", width=44).grid(row=1, column=1, sticky="we")
     ttk.Label(ai_frame, text="模型：").grid(row=2, column=0, sticky="w")
-    ai_model_var = tk.StringVar(value=settings.get("ai_model", AI_MODELS[0]))
+    saved_model = settings.get("ai_model") if settings.get("ai_model_v") == AI_SETTINGS_VERSION else None
+    ai_model_var = tk.StringVar(value=saved_model or AI_MODELS[0])
     ttk.Combobox(ai_frame, textvariable=ai_model_var, values=AI_MODELS, width=24).grid(row=2, column=1, sticky="w")
     ttk.Label(ai_frame, text="課程主題：").grid(row=3, column=0, sticky="w", pady=4)
     ai_topic_var = tk.StringVar(value=settings.get("ai_topic", ""))
@@ -823,7 +826,8 @@ def run_gui():
         ai = {"key": ai_key, "model": ai_model_var.get().strip(), "topic": ai_topic_var.get().strip()} if ai_on_var.get() else None
         save_settings({"keywords": keywords, "corrections": corrections, "glossary": chosen,
                        "ai_on": ai_on_var.get(), "ai_key": ai_key,
-                       "ai_model": ai_model_var.get().strip(), "ai_topic": ai_topic_var.get().strip()})
+                       "ai_model": ai_model_var.get().strip(), "ai_model_v": AI_SETTINGS_VERSION,
+                       "ai_topic": ai_topic_var.get().strip()})
         stop_event.clear()
         start_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
