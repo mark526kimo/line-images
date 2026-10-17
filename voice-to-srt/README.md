@@ -5,7 +5,7 @@
 
 ## 安裝與啟動
 
-1. 安裝 [Python 3.9 以上](https://www.python.org/downloads/)（Windows 安裝時記得勾選 **Add Python to PATH**）。
+1. 安裝 [Python 3.11 以上](https://www.python.org/downloads/)（Windows 安裝第一個畫面記得勾選 **Add python.exe to PATH**）。
 2. 下載程式：打開 <https://github.com/mark526kimo/line-images/archive/refs/heads/claude/voice-to-srt-program-t7aeg7.zip>，解壓縮後進入 `voice-to-srt` 資料夾。
 3. 啟動：
    - **Windows**：雙擊 `start_windows.bat`
