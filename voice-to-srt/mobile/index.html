@@ -154,11 +154,11 @@
     </label>
     <p class="hint">金鑰只存在這台裝置的瀏覽器裡，只會傳給 Google，不會上傳到 GitHub。金鑰可在 Google AI Studio 申請；不要把金鑰貼給別人或貼在公開的地方。</p>
     <label class="field">模型
-      <input id="aiModel" list="aiModels" spellcheck="false" value="gemini-2.5-flash">
+      <input id="aiModel" list="aiModels" spellcheck="false" value="gemini-3.6-flash">
       <datalist id="aiModels">
-        <option value="gemini-2.5-flash"></option>
-        <option value="gemini-2.5-pro"></option>
-        <option value="gemini-2.5-flash-lite"></option>
+        <option value="gemini-3.6-flash"></option>
+        <option value="gemini-3.6-flash-lite"></option>
+        <option value="gemini-3.8-flash"></option>
       </datalist>
     </label>
     <label class="field">課程主題（選填，給 AI 參考）
@@ -513,6 +513,7 @@ async function keepAwake(on) {
 const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
 const AI_BATCH = 60;      // 每次送出的字幕段數
 const AI_CONTEXT = 5;     // 附上前一批最後幾段當上下文
+const AI_MODELS = ['gemini-3.6-flash', 'gemini-3.6-flash-lite', 'gemini-3.8-flash'];  // 預設選項，依序優先
 let aiBackup = null, lastBuiltSrt = '';
 
 function aiKey() { return $('aiKey').value.trim(); }
@@ -551,10 +552,13 @@ async function loadAiModels() {
       .map((m) => m.name.replace(/^models\//, ''))
       .filter((n) => /^gemini/.test(n) && !/embedding|tts|image|live|audio|vision/.test(n));
     if (names.length) {
-      $('aiModels').innerHTML = names.map((n) => `<option value="${n}"></option>`).join('');
-      // 目前填的模型這組金鑰不能用時，自動換成可用的 flash 模型
+      // 預設的三個排最前面（名稱可能帶 -preview 之類的後綴）
+      const preferred = AI_MODELS.map((m) => names.find((n) => n === m) || names.find((n) => n.startsWith(m + '-'))).filter(Boolean);
+      const list = [...new Set([...preferred, ...names])];
+      $('aiModels').innerHTML = list.map((n) => `<option value="${n}"></option>`).join('');
+      // 目前填的模型這組金鑰不能用時，自動換成可用的模型
       if (!names.includes($('aiModel').value.trim())) {
-        $('aiModel').value = names.find((n) => /flash/.test(n) && !/lite|preview|exp/.test(n)) || names[0];
+        $('aiModel').value = preferred[0] || names.find((n) => /flash/.test(n) && !/lite/.test(n)) || names[0];
       }
     }
   } catch (e) {
@@ -617,7 +621,7 @@ async function proofread() {
   if (!segments.length) return;
   if (!aiKey()) { $('aiCard').open = true; setAiStatus('請先在上方「AI 校稿」填入 Gemini API 金鑰。', true); return; }
   if ($('srt').value !== lastBuiltSrt && !confirm('AI 校稿會重新產生字幕，你在結果框裡手動改的內容會被蓋掉。要繼續嗎？')) return;
-  const model = $('aiModel').value.trim() || 'gemini-2.5-flash';
+  const model = $('aiModel').value.trim() || AI_MODELS[0];
   try { localStorage.setItem('aiModel', model); localStorage.setItem('aiTopic', $('aiTopic').value); } catch {}
   $('aiBtn').disabled = true; $('startBtn').disabled = true;
   const before = segments.map((s) => s.text);
@@ -757,7 +761,8 @@ try {
   $('kw').value = localStorage.getItem('keywords') || '';
   if (localStorage.getItem('phonetic') === '0') $('phonetic').checked = false;
   $('aiKey').value = localStorage.getItem('aiKey') || '';
-  $('aiModel').value = localStorage.getItem('aiModel') || $('aiModel').value;
+  const savedModel = localStorage.getItem('aiModel');
+  if (savedModel && !/^gemini-2\.5/.test(savedModel)) $('aiModel').value = savedModel;  // 舊版預設的 2.5 改用新預設
   $('aiTopic').value = localStorage.getItem('aiTopic') || '';
   if (localStorage.getItem('aiAuto') === '0') $('aiAuto').checked = false;
   const g = localStorage.getItem('glossaries');
