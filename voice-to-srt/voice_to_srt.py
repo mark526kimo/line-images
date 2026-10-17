@@ -10,7 +10,9 @@
 """
 
 import argparse
+import json
 import os
+import re
 import sys
 import threading
 
@@ -76,6 +78,66 @@ def make_converter(traditional):
     return cc.convert
 
 
+def parse_corrections(text):
+    """解析「錯字=正確」的更正清單（一行一組），回傳 [(錯, 對), ...]。"""
+    pairs = []
+    for line in (text or "").splitlines():
+        if "=" in line:
+            wrong, right = line.split("=", 1)
+            if wrong.strip():
+                pairs.append((wrong.strip(), right.strip()))
+    return pairs
+
+
+GLOSSARY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossaries")
+GLOSSARY_NAMES = {"biology": "生物學"}
+MAX_KEYWORD_CHARS = 150  # Whisper 的提示長度有限，太長前面會被截掉
+
+
+def list_glossaries():
+    """回傳 {顯示名稱: 檔案路徑}。"""
+    out = {}
+    if os.path.isdir(GLOSSARY_DIR):
+        for name in sorted(os.listdir(GLOSSARY_DIR)):
+            if name.endswith(".txt"):
+                stem = name[:-4]
+                out[GLOSSARY_NAMES.get(stem, stem)] = os.path.join(GLOSSARY_DIR, name)
+    return out
+
+
+def read_glossary(path):
+    """讀取詞庫檔，回傳 (關鍵字清單, 更正文字)。"""
+    keywords, corrections = [], []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            (corrections if "=" in line else keywords).append(line)
+    return keywords, "\n".join(corrections)
+
+
+def apply_corrections(text, pairs):
+    for wrong, right in pairs:
+        text = text.replace(wrong, right)
+    return text
+
+
+# Whisper 在靜音或雜音時常編出的固定句子
+HALLUCINATION_RE = re.compile(r"明鏡與點點|明镜与点点|Amara\.org|字幕志願者|字幕志愿者|請不吝點贊|请不吝点赞|訂閱.*轉發.*打賞|订阅.*转发.*打赏")
+
+
+def is_hallucination(seg, prev_text):
+    """過濾 Whisper 常見的幻覺：靜音時亂編的句子、卡住一直重複同一句。"""
+    if HALLUCINATION_RE.search(seg.text):
+        return True
+    if seg.no_speech_prob > 0.6 and seg.avg_logprob < -1.0:
+        return True
+    if seg.compression_ratio > 2.4:  # 同一段文字裡大量重複
+        return True
+    return bool(prev_text) and seg.text.strip() == prev_text
+
+
 _model_cache = {}
 
 
@@ -93,14 +155,42 @@ def load_model(name, device="auto"):
 
 
 def transcribe_to_srt(path, model_name="small", language=None, traditional=False,
-                      max_chars=0, output=None, log=print, progress=None, stop_event=None):
+                      max_chars=0, output=None, log=print, progress=None, stop_event=None,
+                      keywords="", corrections="", glossary=None):
     """轉換單一檔案，回傳輸出的 srt 路徑。"""
     log(f"載入模型 {model_name}（第一次使用會自動下載，請稍候）…")
     model = load_model(model_name)
     convert = make_converter(traditional)
 
-    # 給中文一段繁體提示，能降低 Whisper 輸出簡體的機率
-    prompt = "以下是普通話的句子，使用繁體中文。" if traditional and language == "zh" else None
+    keyword_list = [k.strip() for k in re.split(r"[,，、\n]", keywords or "") if k.strip()]
+    if glossary:
+        g_keywords, g_corrections = read_glossary(glossary)
+        keyword_list += [k for k in g_keywords if k not in keyword_list]
+        corrections = g_corrections + "\n" + (corrections or "")  # 自己的更正放後面，優先度較高
+        log(f"使用詞庫：{os.path.basename(glossary)}")
+
+    # 長的錯字先換，避免「淋巴細胞」被「細胞」之類的短規則先換掉
+    pairs = sorted(parse_corrections(corrections), key=lambda p: -len(p[0]))
+    # 繁簡轉換可能把「台」變「臺」等，錯字也轉一份，才對得上轉換後的文字
+    pairs += [(convert(w), r) for w, r in pairs if convert(w) != w]
+    pairs.sort(key=lambda p: -len(p[0]))
+
+    # 提示詞：關鍵字能讓人名、專有名詞寫對；繁體提示能降低輸出簡體的機率
+    used, total = [], 0
+    for k in keyword_list:
+        if total + len(k) + 1 > MAX_KEYWORD_CHARS:
+            break
+        used.append(k)
+        total += len(k) + 1
+    if len(used) < len(keyword_list):
+        log(f"提示：關鍵字太多，只用了前 {len(used)} 個（其餘靠自動更正）。")
+    keywords = "、".join(used)
+    prompt_parts = []
+    if keywords:
+        prompt_parts.append(f"相關詞彙：{keywords}。")
+    if traditional and language == "zh":
+        prompt_parts.append("以下是普通話的句子，使用繁體中文。")
+    prompt = "".join(prompt_parts) or None
 
     log(f"開始辨識：{os.path.basename(path)}")
     segments, info = model.transcribe(
@@ -108,6 +198,8 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
         language=language,
         vad_filter=True,
         initial_prompt=prompt,
+        hotwords=keywords or None,  # 每一段都會提示這些詞，長檔案後段也有效
+        beam_size=5,
     )
     if language is None:
         log(f"偵測到語言：{info.language}（信心 {info.language_probability:.0%}）")
@@ -115,12 +207,18 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     duration = info.duration or 0
     output = output or os.path.splitext(path)[0] + ".srt"
     index = 1
+    prev_text = ""
+    skipped = 0
     with open(output, "w", encoding="utf-8") as f:
         for seg in segments:
             if stop_event is not None and stop_event.is_set():
                 log("已取消。")
                 break
-            text = convert(seg.text)
+            if is_hallucination(seg, prev_text):
+                skipped += 1
+                continue
+            prev_text = seg.text.strip()
+            text = apply_corrections(convert(seg.text), pairs)
             for start, end, line in split_long_segment(text, seg.start, seg.end, max_chars):
                 if not line:
                     continue
@@ -131,6 +229,8 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
                 progress(min(seg.end / duration, 1.0))
     if progress:
         progress(1.0)
+    if skipped:
+        log(f"已略過 {skipped} 段疑似幻覺／重複的內容。")
     log(f"完成！已輸出：{output}")
     return output
 
@@ -144,16 +244,48 @@ def run_cli(argv):
     p.add_argument("-l", "--language", default=None, help="語言代碼，如 zh、en、ja；不填則自動偵測")
     p.add_argument("-t", "--traditional", action="store_true", help="中文輸出轉為繁體（台灣用語）")
     p.add_argument("--max-chars", type=int, default=0, help="每行字幕最多字數，0 為不切")
+    p.add_argument("-k", "--keywords", default="", help="人名、專有名詞等關鍵字，用逗號分隔，可提高這些詞的準確度")
+    p.add_argument("-g", "--glossary", help="專業詞庫：biology（生物學）或詞庫檔路徑")
+    p.add_argument("-c", "--corrections", help="自動更正清單檔，每行一組「錯字=正確」")
     p.add_argument("-o", "--output", help="輸出檔名（僅限單一輸入檔）")
     args = p.parse_args(argv)
     if args.output and len(args.files) > 1:
         p.error("-o 只能搭配單一輸入檔")
+    corrections = ""
+    if args.corrections:
+        with open(args.corrections, encoding="utf-8") as f:
+            corrections = f.read()
+    glossary = args.glossary
+    if glossary and not os.path.isfile(glossary):
+        glossary = os.path.join(GLOSSARY_DIR, glossary + ".txt")
+        if not os.path.isfile(glossary):
+            p.error(f"找不到詞庫：{args.glossary}")
     for path in args.files:
         transcribe_to_srt(path, args.model, args.language, args.traditional,
-                          args.max_chars, args.output)
+                          args.max_chars, args.output,
+                          keywords=args.keywords, corrections=corrections, glossary=glossary)
 
 
 # ---------------------------------------------------------------- 圖形介面
+
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".voice_to_srt.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
 
 def run_gui():
     import tkinter as tk
@@ -161,7 +293,7 @@ def run_gui():
 
     root = tk.Tk()
     root.title("語音轉 SRT 字幕")
-    root.geometry("720x540")
+    root.geometry("760x700")
 
     files = []
     stop_event = threading.Event()
@@ -196,7 +328,7 @@ def run_gui():
     ttk.Label(opts, text="模型：").grid(row=0, column=0, sticky="w")
     model_var = tk.StringVar(value="small")
     ttk.Combobox(opts, textvariable=model_var, values=MODELS, state="readonly", width=16).grid(row=0, column=1, sticky="w")
-    ttk.Label(opts, text="越大越準但越慢；一般電腦建議 small", foreground="gray").grid(row=0, column=2, sticky="w", padx=8)
+    ttk.Label(opts, text="越大越準但越慢；要更準請選 large-v3-turbo", foreground="gray").grid(row=0, column=2, sticky="w", padx=8)
 
     ttk.Label(opts, text="語言：").grid(row=1, column=0, sticky="w", pady=4)
     lang_var = tk.StringVar(value="中文")
@@ -209,6 +341,48 @@ def run_gui():
     max_var = tk.IntVar(value=20)
     ttk.Spinbox(opts, from_=0, to=100, textvariable=max_var, width=6).grid(row=2, column=1, sticky="w")
     ttk.Label(opts, text="0 = 不切行", foreground="gray").grid(row=2, column=2, sticky="w", padx=8)
+
+    settings = load_settings()
+    glossaries = {"無": None, **list_glossaries()}
+    ttk.Label(opts, text="專業詞庫：").grid(row=7, column=0, sticky="w", pady=4)
+    gl_row = ttk.Frame(opts)
+    gl_row.grid(row=7, column=1, columnspan=2, sticky="w")
+    gl_var = tk.StringVar(value=settings.get("glossary", "無") if settings.get("glossary") in glossaries else "無")
+    gl_combo = ttk.Combobox(gl_row, textvariable=gl_var, values=list(glossaries), state="readonly", width=14)
+    gl_combo.pack(side="left")
+
+    def load_glossary_file():
+        p = filedialog.askopenfilename(title="選擇詞庫檔", filetypes=[("詞庫", "*.txt")])
+        if p:
+            name = os.path.splitext(os.path.basename(p))[0]
+            glossaries[name] = p
+            gl_combo.configure(values=list(glossaries))
+            gl_var.set(name)
+
+    def open_glossary_dir():
+        os.makedirs(GLOSSARY_DIR, exist_ok=True)
+        if sys.platform.startswith("win"):
+            os.startfile(GLOSSARY_DIR)
+        else:
+            import subprocess
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", GLOSSARY_DIR])
+
+    ttk.Button(gl_row, text="載入其他詞庫…", command=load_glossary_file).pack(side="left", padx=4)
+    ttk.Button(gl_row, text="開啟詞庫資料夾", command=open_glossary_dir).pack(side="left")
+
+    ttk.Label(opts, text="關鍵字：").grid(row=3, column=0, sticky="w", pady=4)
+    kw_var = tk.StringVar(value=settings.get("keywords", ""))
+    ttk.Entry(opts, textvariable=kw_var).grid(row=3, column=1, columnspan=2, sticky="we")
+    ttk.Label(opts, text="人名、公司名、專有名詞，用逗號分隔，例如：王小明, 台積電, ChatGPT",
+              foreground="gray").grid(row=4, column=1, columnspan=2, sticky="w")
+
+    ttk.Label(opts, text="自動更正：").grid(row=5, column=0, sticky="nw", pady=4)
+    corr_box = tk.Text(opts, height=3, width=40)
+    corr_box.grid(row=5, column=1, columnspan=2, sticky="we", pady=4)
+    corr_box.insert("1.0", settings.get("corrections", ""))
+    ttk.Label(opts, text="每行一組「錯字=正確」，例如：台機電=台積電；轉完會自動替換",
+              foreground="gray").grid(row=6, column=1, columnspan=2, sticky="w")
+    opts.columnconfigure(2, weight=1)
 
     # 進度與紀錄
     progress = ttk.Progressbar(frm, maximum=1.0)
@@ -235,7 +409,7 @@ def run_gui():
     def set_progress(v):
         root.after(0, lambda: progress.configure(value=v))
 
-    def worker(job_files, model, lang, trad, max_chars):
+    def worker(job_files, model, lang, trad, max_chars, keywords, corrections, glossary):
         try:
             for i, path in enumerate(job_files, 1):
                 if stop_event.is_set():
@@ -243,7 +417,8 @@ def run_gui():
                 log(f"── ({i}/{len(job_files)}) ──")
                 set_progress(0)
                 transcribe_to_srt(path, model, lang, trad, max_chars,
-                                  log=log, progress=set_progress, stop_event=stop_event)
+                                  log=log, progress=set_progress, stop_event=stop_event,
+                                  keywords=keywords, corrections=corrections, glossary=glossary)
             if not stop_event.is_set():
                 root.after(0, lambda: messagebox.showinfo("完成", "全部轉換完成！SRT 已存在原檔案旁邊。"))
         except Exception as e:
@@ -260,12 +435,16 @@ def run_gui():
             max_chars = int(max_var.get())
         except (tk.TclError, ValueError):
             max_chars = 0
+        keywords = kw_var.get()
+        corrections = corr_box.get("1.0", "end").strip()
+        save_settings({"keywords": keywords, "corrections": corrections, "glossary": gl_var.get()})
         stop_event.clear()
         start_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
         threading.Thread(
             target=worker,
-            args=(list(files), model_var.get(), LANGUAGES[lang_var.get()], trad_var.get(), max_chars),
+            args=(list(files), model_var.get(), LANGUAGES[lang_var.get()], trad_var.get(), max_chars,
+                  keywords, corrections, glossaries.get(gl_var.get())),
             daemon=True,
         ).start()
 

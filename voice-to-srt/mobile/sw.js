@@ -1,6 +1,6 @@
 // 讓網頁可以加到主畫面並離線開啟；模型檔由 transformers.js 自己快取
-const CACHE = 'voice-srt-v1';
-const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.svg'];
+const CACHE = 'voice-srt-v2';
+const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.svg', '../glossaries/biology.txt'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

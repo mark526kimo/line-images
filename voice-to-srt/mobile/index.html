@@ -65,6 +65,7 @@
     width: 100%; min-height: 220px; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
     color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px;
   }
+  textarea.small { min-height: 72px; font: inherit; font-size: 15px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -109,6 +110,15 @@
       </label>
       <label class="check"><input id="trad" type="checkbox" checked>轉繁體</label>
     </div>
+    <label class="field">專業詞庫
+      <select id="glossary">
+        <option value="">無</option>
+        <option value="biology" selected>生物學（大陸用語→台灣用語）</option>
+      </select>
+    </label>
+    <label class="field">自己的自動更正（每行一組「錯字=正確」）
+      <textarea id="corr" class="small" spellcheck="false" placeholder="台機電=台積電&#10;王曉明=王小明"></textarea>
+    </label>
     <p class="hint">第一次使用會下載模型（tiny 約 40 MB、base 約 80 MB、small 約 250 MB），之後存在手機裡可離線使用，建議連 Wi‑Fi。字數上限填 0 為不切行。</p>
   </section>
 
@@ -252,6 +262,48 @@ function setupConverter() {
   }
 }
 
+// 自動更正：錯字也經過繁簡轉換一次，才對得上轉換後的文字（例如「台」被轉成「臺」）
+async function loadGlossary(name) {
+  if (!name) return '';
+  try {
+    const res = await fetch(`../glossaries/${name}.txt`);
+    if (!res.ok) throw new Error(res.status);
+    return await res.text();
+  } catch {
+    setStatus('讀不到專業詞庫，這次只用自己的自動更正。', true);
+    return '';
+  }
+}
+
+function correctionPairs(text) {
+  const pairs = [];
+  for (const line of text.split('\n')) {
+    if (line.trim().startsWith('#')) continue;
+    const i = line.indexOf('=');
+    if (i <= 0) continue;
+    const wrong = line.slice(0, i).trim(), right = line.slice(i + 1).trim();
+    if (!wrong) continue;
+    pairs.push([wrong, right]);
+    const cw = convert(wrong);
+    if (cw !== wrong) pairs.push([cw, right]);
+  }
+  // 長的錯字先換，避免被短規則先換掉
+  return pairs.sort((a, b) => b[0].length - a[0].length);
+}
+function applyCorrections(text, pairs) {
+  for (const [w, r] of pairs) text = text.split(w).join(r);
+  return text;
+}
+
+// Whisper 在靜音或雜音時常編出的固定句子，以及卡住一直重複的內容
+const HALLUCINATIONS = /明鏡與點點|明镜与点点|Amara\.org|字幕志願者|字幕志愿者|請不吝點贊|请不吝点赞|訂閱.*轉發.*打賞|订阅.*转发.*打赏/;
+function isHallucination(text, prev) {
+  if (HALLUCINATIONS.test(text)) return true;
+  if (prev && text === prev) return true;
+  const chars = [...text.replace(/\s/g, '')];
+  return chars.length >= 12 && new Set(chars).size / chars.length < 0.25;
+}
+
 function buildSrt() {
   const maxChars = parseInt($('maxChars').value, 10) || 0;
   let i = 1, out = '';
@@ -338,6 +390,9 @@ $('startBtn').addEventListener('click', async () => {
   if (!currentFile) return;
   segments = []; $('live').innerHTML = ''; $('resultCard').hidden = true; $('bar').value = 0;
   setRunning(true); keepAwake(true); setupConverter();
+  try { localStorage.setItem('corrections', $('corr').value); localStorage.setItem('glossary', $('glossary').value); } catch {}
+  const pairs = correctionPairs((await loadGlossary($('glossary').value)) + '\n' + $('corr').value);
+  let lastRaw = '';
   setStatus('讀取音訊中…');
   let audio;
   try { audio = await decodeTo16k(currentFile); }
@@ -354,7 +409,9 @@ $('startBtn').addEventListener('click', async () => {
       $('bar').value = data.value;
       setStatus(`辨識中… ${Math.round(data.value * 100)}%`);
     } else if (data.type === 'segment') {
-      const seg = { start: data.start, end: data.end, text: convert(data.text) };
+      if (isHallucination(data.text, lastRaw)) return;
+      lastRaw = data.text;
+      const seg = { start: data.start, end: data.end, text: applyCorrections(convert(data.text), pairs) };
       segments.push(seg);
       const div = document.createElement('div');
       const t = document.createElement('time'); t.textContent = ts(seg.start).slice(0, 8);
@@ -390,6 +447,12 @@ $('shareBtn').addEventListener('click', async () => {
   }
 });
 if (!navigator.share) $('shareBtn').hidden = true;
+
+try {
+  $('corr').value = localStorage.getItem('corrections') || '';
+  const g = localStorage.getItem('glossary');
+  if (g !== null) $('glossary').value = g;
+} catch {}
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
