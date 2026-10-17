@@ -48,3 +48,22 @@ python voice_to_srt.py a.mp3 b.mp3 c.mp3                # 一次轉多個
 | large-v3 | 最慢 | 最好 | 有 NVIDIA 顯示卡 |
 
 有 NVIDIA 顯示卡且裝好 CUDA 會自動用 GPU 加速，否則用 CPU。
+
+## 手機版（`mobile/` 資料夾）
+
+不用安裝 App，用手機瀏覽器打開就能用，一樣在手機上離線辨識，檔案不會上傳。
+
+- 可以選手機裡的音訊／影片，或直接按「錄音」
+- 結果可以直接修改，再「下載 SRT」或「分享」到 LINE、雲端硬碟等
+- 在瀏覽器選「加到主畫面」就會像 App 一樣出現在桌面
+- 支援 iPhone（Safari）與 Android（Chrome），新手機會自動用 GPU 加速
+
+### 怎麼放到網路上給手機開
+
+手機版必須透過 **https 網址**開啟（麥克風和離線功能需要）。最簡單是用 GitHub Pages：
+
+1. 到 GitHub 儲存庫的 **Settings → Pages**
+2. Source 選 **Deploy from a branch**，選分支和根目錄 `/ (root)`，按 Save
+3. 等一兩分鐘，手機開 `https://<你的帳號>.github.io/<儲存庫名稱>/voice-to-srt/mobile/`
+
+> 手機效能有限：建議用 tiny 或 base 模型；一小時的錄音可能要轉十幾分鐘以上，轉換時請保持畫面開著。
