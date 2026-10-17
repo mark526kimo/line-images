@@ -94,7 +94,9 @@ def parse_corrections(text):
 
 GLOSSARY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossaries")
 GLOSSARY_NAMES = {"biology": "生物學", "chemistry": "化學"}
-MAX_KEYWORD_CHARS = 150  # Whisper 的提示長度有限，太長前面會被截掉
+# 給 Whisper 的提示只放自己填的少數關鍵字。提示太長（例如塞進整個詞庫）會讓 Whisper
+# 把一整段 30 秒壓縮成幾個字直接跳過，詞庫只用在讀音比對、自動更正和 AI 校稿。
+MAX_PROMPT_KEYWORD_CHARS = 40
 
 
 def list_glossaries():
@@ -418,6 +420,7 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     convert = make_converter(traditional)
 
     keyword_list = [k.strip() for k in re.split(r"[,，、\n]", keywords or "") if k.strip()]
+    own_keywords = list(keyword_list)
     if isinstance(glossary, str):
         glossary = [glossary]
     for g_path in glossary or []:
@@ -436,15 +439,13 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     if phonetic and keyword_list and not terms and _pinyin("測") is None:
         log("提示：未安裝 pypinyin，略過讀音比對校正。執行 pip install pypinyin")
 
-    # 提示詞：關鍵字能讓人名、專有名詞寫對；繁體提示能降低輸出簡體的機率
+    # 提示詞：只放自己填的少數關鍵字（見 MAX_PROMPT_KEYWORD_CHARS 的說明）；繁體提示能降低輸出簡體的機率
     used, total = [], 0
-    for k in keyword_list:
-        if total + len(k) + 1 > MAX_KEYWORD_CHARS:
+    for k in own_keywords:
+        if total + len(k) + 1 > MAX_PROMPT_KEYWORD_CHARS:
             break
         used.append(k)
         total += len(k) + 1
-    if len(used) < len(keyword_list):
-        log(f"關鍵字共 {len(keyword_list)} 個：前 {len(used)} 個用來提示模型，全部都會用在讀音比對和自動更正。")
     keywords = "、".join(used)
     prompt_parts = []
     if keywords:
@@ -459,8 +460,9 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
         language=language,
         vad_filter=True,
         initial_prompt=prompt,
-        hotwords=keywords or None,  # 每一段都會提示這些詞，長檔案後段也有效
         beam_size=5,
+        # 每段獨立辨識（和網頁版一樣），避免前一段的錯誤或重複一路影響下去
+        condition_on_previous_text=False,
     )
     if language is None:
         log(f"偵測到語言：{info.language}（信心 {info.language_probability:.0%}）")
