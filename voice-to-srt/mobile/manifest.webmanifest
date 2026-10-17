@@ -1,0 +1,11 @@
+{
+  "name": "語音轉字幕",
+  "short_name": "語音轉字幕",
+  "description": "在手機上離線把語音轉成 SRT 字幕",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f766e",
+  "theme_color": "#0f766e",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
