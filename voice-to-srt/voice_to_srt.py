@@ -117,10 +117,89 @@ def read_glossary(path):
     return keywords, "\n".join(corrections)
 
 
+def replace_safe(text, wrong, right):
+    """替換錯字；如果這個位置本來就是正確寫法的一部分（例如「磷脂=磷脂質」遇到「磷脂質」）就不換。"""
+    k = right.find(wrong)
+    out, i = [], 0
+    while True:
+        j = text.find(wrong, i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        if k >= 0 and j - k >= 0 and text.startswith(right, j - k):
+            out.append(text[i:j + len(wrong)])
+        else:
+            out.append(text[i:j] + right)
+        i = j + len(wrong)
+
+
 def apply_corrections(text, pairs):
     for wrong, right in pairs:
-        text = text.replace(wrong, right)
+        text = replace_safe(text, wrong, right)
     return text
+
+
+# ---------- 讀音比對校正 ----------
+# 把辨識結果裡和關鍵字「讀音相同」的字串換成關鍵字，例如 林酸基→磷酸基、磷酸跟→磷酸根。
+# 3 個字的詞要聲調也相同；4 個字以上不比聲調。差異只是詞頭或詞尾的「和、的、是…」這類虛字時不換，
+# 避免「細胞和組織」被改成「細胞核組織」。
+FUNCTION_CHARS = set("和與与及的了是在也就都有或而呢嗎吗吧啊")
+
+
+def _is_cjk(c):
+    return "\u3400" <= c <= "\u9fff"
+
+
+def _pinyin(text):
+    try:
+        from pypinyin import lazy_pinyin, Style
+    except ImportError:
+        return None
+    py = lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True, errors=lambda s: list(s))
+    return py if len(py) == len(text) else None
+
+
+def phonetic_terms(keywords):
+    terms = []
+    for term in dict.fromkeys(keywords):
+        if len(term) < 3 or not all(_is_cjk(c) for c in term):
+            continue
+        py = _pinyin(term)
+        if not py:
+            continue
+        toned = len(term) == 3
+        terms.append((term, [p if toned else p.rstrip("012345") for p in py], toned))
+    return sorted(terms, key=lambda t: -len(t[0]))
+
+
+def phonetic_fix(text, terms):
+    if not terms:
+        return text
+    py = _pinyin(text)
+    if not py:
+        return text
+    used = [False] * len(text)
+    repl = []
+    for term, key, toned in terms:
+        n = len(term)
+        for i in range(len(text) - n + 1):
+            diffs = []
+            for k in range(n):
+                c = text[i + k]
+                p = py[i + k] if toned else py[i + k].rstrip("012345")
+                if used[i + k] or not _is_cjk(c) or p != key[k]:
+                    break
+                if c != term[k]:
+                    diffs.append((k, c))
+            else:
+                for k in range(n):
+                    used[i + k] = True  # 已經正確的詞也佔住位置，避免被別的詞改掉
+                if diffs and not all(c in FUNCTION_CHARS and k in (0, n - 1) for k, c in diffs):
+                    repl.append((i, term))
+    chars = list(text)
+    for i, term in sorted(repl, reverse=True):
+        chars[i:i + len(term)] = list(term)
+    return "".join(chars)
 
 
 # Whisper 在靜音或雜音時常編出的固定句子
@@ -156,7 +235,7 @@ def load_model(name, device="auto"):
 
 def transcribe_to_srt(path, model_name="small", language=None, traditional=False,
                       max_chars=0, output=None, log=print, progress=None, stop_event=None,
-                      keywords="", corrections="", glossary=None):
+                      keywords="", corrections="", glossary=None, phonetic=True):
     """轉換單一檔案，回傳輸出的 srt 路徑。"""
     log(f"載入模型 {model_name}（第一次使用會自動下載，請稍候）…")
     model = load_model(model_name)
@@ -174,6 +253,10 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     # 繁簡轉換可能把「台」變「臺」等，錯字也轉一份，才對得上轉換後的文字
     pairs += [(convert(w), r) for w, r in pairs if convert(w) != w]
     pairs.sort(key=lambda p: -len(p[0]))
+
+    terms = phonetic_terms(keyword_list) if phonetic else []
+    if phonetic and keyword_list and not terms and _pinyin("測") is None:
+        log("提示：未安裝 pypinyin，略過讀音比對校正。執行 pip install pypinyin")
 
     # 提示詞：關鍵字能讓人名、專有名詞寫對；繁體提示能降低輸出簡體的機率
     used, total = [], 0
@@ -218,7 +301,7 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
                 skipped += 1
                 continue
             prev_text = seg.text.strip()
-            text = apply_corrections(convert(seg.text), pairs)
+            text = phonetic_fix(apply_corrections(convert(seg.text), pairs), terms)
             for start, end, line in split_long_segment(text, seg.start, seg.end, max_chars):
                 if not line:
                     continue

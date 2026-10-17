@@ -92,6 +92,7 @@
           <option value="onnx-community/whisper-tiny">tiny・最快</option>
           <option value="onnx-community/whisper-base" selected>base・建議</option>
           <option value="onnx-community/whisper-small">small・較準</option>
+          <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo・最準（電腦用）</option>
         </select>
       </label>
       <label class="field">語言
@@ -113,13 +114,17 @@
     <label class="field">專業詞庫
       <select id="glossary">
         <option value="">無</option>
-        <option value="biology" selected>生物學（大陸用語→台灣用語）</option>
+        <option value="biology" selected>生物學</option>
       </select>
     </label>
+    <label class="field">自己的關鍵字（人名、專有名詞，用逗號或換行分隔）
+      <textarea id="kw" class="small" spellcheck="false" placeholder="磷酸根, 草履蟲, 陳老師"></textarea>
+    </label>
+    <label class="check"><input id="phonetic" type="checkbox" checked>讀音比對校正（同音錯字自動換成關鍵字）</label>
     <label class="field">自己的自動更正（每行一組「錯字=正確」）
       <textarea id="corr" class="small" spellcheck="false" placeholder="台機電=台積電&#10;王曉明=王小明"></textarea>
     </label>
-    <p class="hint">第一次使用會下載模型（tiny 約 40 MB、base 約 80 MB、small 約 250 MB），之後存在手機裡可離線使用，建議連 Wi‑Fi。字數上限填 0 為不切行。</p>
+    <p class="hint">第一次使用會下載模型（tiny 約 40 MB、base 約 80 MB、small 約 250 MB、large-v3-turbo 約 1 GB），之後存在裝置裡可離線使用，建議連 Wi‑Fi。large-v3-turbo 最準，適合在電腦的 Chrome／Edge 使用。字數上限填 0 為不切行。</p>
   </section>
 
   <section class="card">
@@ -143,6 +148,7 @@
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/cn2t.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pinyin-pro@3.26.0/dist/index.js"></script>
 <script type="text/plain" id="workerSrc">
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6';
 env.allowLocalModels = false;
@@ -150,18 +156,21 @@ env.allowLocalModels = false;
 const SR = 16000;
 let asr = null, loadedKey = null;
 
-async function hasWebGPU() {
-  try { return !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch { return false; }
+async function gpuAdapter() {
+  try { return navigator.gpu ? await navigator.gpu.requestAdapter() : null; } catch { return null; }
 }
 
 async function load(model) {
-  const device = (await hasWebGPU()) ? 'webgpu' : 'wasm';
+  const adapter = await gpuAdapter();
+  const big = model.includes('large');
+  // 大模型的編碼器要用 fp16 才放得進 GPU；不支援 fp16 就改用 CPU
+  const device = adapter && (!big || adapter.features.has('shader-f16')) ? 'webgpu' : 'wasm';
   const key = model + '|' + device;
   if (asr && loadedKey === key) return;
   const progress_callback = (p) => {
     if (p.status === 'progress' && p.total) postMessage({ type: 'download', file: p.file, loaded: p.loaded, total: p.total });
   };
-  const dtype = device === 'webgpu' ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8';
+  const dtype = device === 'webgpu' ? { encoder_model: big ? 'fp16' : 'fp32', decoder_model_merged: 'q4' } : 'q8';
   try {
     asr = await pipeline('automatic-speech-recognition', model, { device, dtype, progress_callback });
   } catch (e) {
@@ -275,6 +284,11 @@ async function loadGlossary(name) {
   }
 }
 
+// 詞庫格式：沒有「=」的行是關鍵字，有「=」的行是「錯字=正確」
+function glossaryKeywords(text) {
+  return text.split(/[\n,，、]/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#') && !l.includes('='));
+}
+
 function correctionPairs(text) {
   const pairs = [];
   for (const line of text.split('\n')) {
@@ -290,9 +304,73 @@ function correctionPairs(text) {
   // 長的錯字先換，避免被短規則先換掉
   return pairs.sort((a, b) => b[0].length - a[0].length);
 }
+// 逐一替換；如果這個位置本來就是正確寫法的一部分（例如「磷脂=磷脂質」遇到「磷脂質」）就不換
+function replaceSafe(text, wrong, right) {
+  const k = right.indexOf(wrong);
+  let out = '', i = 0;
+  for (;;) {
+    const j = text.indexOf(wrong, i);
+    if (j < 0) return out + text.slice(i);
+    if (k >= 0 && j - k >= 0 && text.startsWith(right, j - k)) {
+      out += text.slice(i, j + wrong.length);
+    } else {
+      out += text.slice(i, j) + right;
+    }
+    i = j + wrong.length;
+  }
+}
 function applyCorrections(text, pairs) {
-  for (const [w, r] of pairs) text = text.split(w).join(r);
+  for (const [w, r] of pairs) text = replaceSafe(text, w, r);
   return text;
+}
+
+// ---------- 讀音比對校正 ----------
+// 把辨識結果裡和關鍵字「讀音相同」的字串換成關鍵字，例如 林酸基→磷酸基、磷酸跟→磷酸根。
+// 3 個字的詞要聲調也相同；4 個字以上不比聲調。差異只是詞頭或詞尾的「和、的、是…」這類虛字時不換，避免「細胞和組織」被改成「細胞核組織」。
+const FUNCTION_CHARS = new Set('和與与及的了是在也就都有或而呢嗎吗吧啊'.split(''));
+const CJK = /^[\u3400-\u9fff]$/;
+function pinyinOf(text) {
+  try { return pinyinPro.pinyin(text, { toneType: 'num', type: 'array' }); } catch { return null; }
+}
+function phoneticTerms(keywords) {
+  if (!window.pinyinPro) return [];
+  const terms = [];
+  for (const term of new Set(keywords)) {
+    const chars = [...term];
+    if (chars.length < 3 || !chars.every((c) => CJK.test(c))) continue;
+    const py = pinyinOf(term);
+    if (!py || py.length !== chars.length) continue;
+    const toned = chars.length === 3;
+    terms.push({ term, chars, key: py.map((p) => toned ? p : p.replace(/\d/g, '')), toned });
+  }
+  return terms.sort((a, b) => b.chars.length - a.chars.length);
+}
+function phoneticFix(text, terms) {
+  if (!terms.length) return text;
+  const chars = [...text];
+  const py = pinyinOf(text);
+  if (!py || py.length !== chars.length) return text;
+  const used = new Array(chars.length).fill(false);
+  const repl = [];
+  for (const t of terms) {
+    const L = t.chars.length;
+    for (let i = 0; i + L <= chars.length; i++) {
+      let same = true, diffs = [];  // [位置, 字]
+      for (let k = 0; k < L && same; k++) {
+        const c = chars[i + k];
+        if (used[i + k] || !CJK.test(c)) { same = false; break; }
+        const p = t.toned ? py[i + k] : py[i + k].replace(/\d/g, '');
+        if (p !== t.key[k]) same = false;
+        else if (c !== t.chars[k]) diffs.push([k, c]);
+      }
+      if (!same) continue;
+      for (let k = 0; k < L; k++) used[i + k] = true;  // 已經正確的詞也要佔住位置，避免被別的詞改掉
+      if (!diffs.length || diffs.every(([k, c]) => FUNCTION_CHARS.has(c) && (k === 0 || k === L - 1))) continue;
+      repl.push([i, t]);
+    }
+  }
+  for (const [i, t] of repl.sort((a, b) => b[0] - a[0])) chars.splice(i, t.chars.length, ...t.chars);
+  return chars.join('');
 }
 
 // Whisper 在靜音或雜音時常編出的固定句子，以及卡住一直重複的內容
@@ -390,8 +468,16 @@ $('startBtn').addEventListener('click', async () => {
   if (!currentFile) return;
   segments = []; $('live').innerHTML = ''; $('resultCard').hidden = true; $('bar').value = 0;
   setRunning(true); keepAwake(true); setupConverter();
-  try { localStorage.setItem('corrections', $('corr').value); localStorage.setItem('glossary', $('glossary').value); } catch {}
-  const pairs = correctionPairs((await loadGlossary($('glossary').value)) + '\n' + $('corr').value);
+  try {
+    localStorage.setItem('corrections', $('corr').value);
+    localStorage.setItem('glossary', $('glossary').value);
+    localStorage.setItem('keywords', $('kw').value);
+    localStorage.setItem('phonetic', $('phonetic').checked ? '1' : '0');
+  } catch {}
+  const glossaryText = await loadGlossary($('glossary').value);
+  const pairs = correctionPairs(glossaryText + '\n' + $('corr').value);
+  // 自己的關鍵字排前面，同長度時優先
+  const terms = $('phonetic').checked ? phoneticTerms([...glossaryKeywords($('kw').value), ...glossaryKeywords(glossaryText)]) : [];
   let lastRaw = '';
   setStatus('讀取音訊中…');
   let audio;
@@ -411,7 +497,7 @@ $('startBtn').addEventListener('click', async () => {
     } else if (data.type === 'segment') {
       if (isHallucination(data.text, lastRaw)) return;
       lastRaw = data.text;
-      const seg = { start: data.start, end: data.end, text: applyCorrections(convert(data.text), pairs) };
+      const seg = { start: data.start, end: data.end, text: phoneticFix(applyCorrections(convert(data.text), pairs), terms) };
       segments.push(seg);
       const div = document.createElement('div');
       const t = document.createElement('time'); t.textContent = ts(seg.start).slice(0, 8);
@@ -450,6 +536,8 @@ if (!navigator.share) $('shareBtn').hidden = true;
 
 try {
   $('corr').value = localStorage.getItem('corrections') || '';
+  $('kw').value = localStorage.getItem('keywords') || '';
+  if (localStorage.getItem('phonetic') === '0') $('phonetic').checked = false;
   const g = localStorage.getItem('glossary');
   if (g !== null) $('glossary').value = g;
 } catch {}
