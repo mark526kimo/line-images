@@ -514,6 +514,9 @@ const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
 const AI_BATCH = 60;      // 每次送出的字幕段數
 const AI_CONTEXT = 5;     // 附上前一批最後幾段當上下文
 const AI_MODELS = ['gemini-3.6-flash', 'gemini-3.6-flash-lite', 'gemini-3.8-flash'];  // 預設選項，依序優先
+const AI_RETRY_CODES = new Set([429, 500, 502, 503, 504]);  // 忙碌、暫時性錯誤：等一下重試
+const AI_RETRY_WAITS = [3, 8, 20];                          // 每次重試前等幾秒
+let aiAvailable = [];                                       // 這組金鑰可用、依優先順序排好的預設模型
 let aiBackup = null, lastBuiltSrt = '';
 
 function aiKey() { return $('aiKey').value.trim(); }
@@ -533,13 +536,40 @@ async function geminiFetch(path, body) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const msg = data.error && data.error.message || res.statusText;
-    if (res.status === 400 && /API key/i.test(msg)) throw new Error('API 金鑰無效，請檢查是否貼對。');
-    if (res.status === 403) throw new Error('這組金鑰沒有權限使用 Gemini API：' + msg);
-    if (res.status === 404) throw new Error(`找不到模型「${$('aiModel').value}」，請從模型清單另選一個。`);
-    if (res.status === 429) throw new Error('用量超過限制（免費額度或每分鐘上限），請稍後再試。');
-    throw new Error(`Gemini 錯誤 ${res.status}：${msg}`);
+    const fail = (text) => Object.assign(new Error(text), { status: res.status });
+    if (res.status === 400 && /API key/i.test(msg)) throw fail('API 金鑰無效，請檢查是否貼對。');
+    if (res.status === 403) throw fail('這組金鑰沒有權限使用 Gemini API：' + msg);
+    if (res.status === 404) throw fail(`找不到模型「${$('aiModel').value}」，請從模型清單另選一個。`);
+    if (res.status === 429) throw fail('用量超過限制（免費額度或每分鐘上限），請稍後再試。');
+    if (res.status === 503) throw fail('Gemini 模型目前太忙（Google 端暫時性問題），請稍後再試。');
+    throw fail(`Gemini 錯誤 ${res.status}：${msg}`);
   }
   return data;
+}
+
+const sleep = (sec) => new Promise((r) => setTimeout(r, sec * 1000));
+
+// 忙碌時等一下重試；一直忙就換 models 裡的下一個模型（直接修改 models，後面的批次沿用）
+async function geminiGenerate(models, body, onWait) {
+  for (;;) {
+    const model = models[0];
+    let last;
+    for (let attempt = 0; attempt <= AI_RETRY_WAITS.length; attempt++) {
+      try {
+        return await geminiFetch(`models/${encodeURIComponent(model)}:generateContent`, body);
+      } catch (e) {
+        if (!AI_RETRY_CODES.has(e.status)) throw e;
+        last = e;
+        if (attempt < AI_RETRY_WAITS.length) {
+          onWait(`Gemini 忙碌（${e.status}），${AI_RETRY_WAITS[attempt]} 秒後重試…`);
+          await sleep(AI_RETRY_WAITS[attempt]);
+        }
+      }
+    }
+    if (models.length <= 1) throw last;
+    models.shift();
+    onWait(`${model} 一直忙碌，改用 ${models[0]}…`);
+  }
 }
 
 // 用金鑰取得可用的模型，填進下拉清單
@@ -555,6 +585,7 @@ async function loadAiModels() {
       // 預設的三個排最前面（名稱可能帶 -preview 之類的後綴）
       const preferred = AI_MODELS.map((m) => names.find((n) => n === m) || names.find((n) => n.startsWith(m + '-'))).filter(Boolean);
       const list = [...new Set([...preferred, ...names])];
+      aiAvailable = preferred;
       $('aiModels').innerHTML = list.map((n) => `<option value="${n}"></option>`).join('');
       // 目前填的模型這組金鑰不能用時，自動換成可用的模型
       if (!names.includes($('aiModel').value.trim())) {
@@ -581,10 +612,10 @@ function aiPrompt() {
   ].filter(Boolean).join('\n');
 }
 
-async function proofreadBatch(model, batch, context) {
+async function proofreadBatch(models, batch, context, onWait) {
   const lines = batch.map((seg) => `${seg.id}|${seg.text}`).join('\n');
   const ctx = context.length ? `上下文（不用輸出）：\n${context.map((s) => s.text).join('\n')}\n\n` : '';
-  const data = await geminiFetch(`models/${encodeURIComponent(model)}:generateContent`, {
+  const data = await geminiGenerate(models, {
     systemInstruction: { parts: [{ text: aiPrompt() }] },
     contents: [{ role: 'user', parts: [{ text: `${ctx}請校對以下字幕（格式：編號|文字）：\n${lines}` }] }],
     generationConfig: {
@@ -595,7 +626,7 @@ async function proofreadBatch(model, batch, context) {
         items: { type: 'OBJECT', properties: { id: { type: 'INTEGER' }, text: { type: 'STRING' } }, required: ['id', 'text'] },
       },
     },
-  });
+  }, onWait);
   const cand = data.candidates && data.candidates[0];
   if (!cand) throw new Error('Gemini 沒有回傳結果' + (data.promptFeedback ? `（${data.promptFeedback.blockReason || ''}）` : ''));
   const text = ((cand.content && cand.content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
@@ -622,6 +653,8 @@ async function proofread() {
   if (!aiKey()) { $('aiCard').open = true; setAiStatus('請先在上方「AI 校稿」填入 Gemini API 金鑰。', true); return; }
   if ($('srt').value !== lastBuiltSrt && !confirm('AI 校稿會重新產生字幕，你在結果框裡手動改的內容會被蓋掉。要繼續嗎？')) return;
   const model = $('aiModel').value.trim() || AI_MODELS[0];
+  // 先用選的模型，忙碌時再依預設順序換
+  const models = [model, ...(aiAvailable.length ? aiAvailable : AI_MODELS).filter((m) => m !== model)];
   try { localStorage.setItem('aiModel', model); localStorage.setItem('aiTopic', $('aiTopic').value); } catch {}
   $('aiBtn').disabled = true; $('startBtn').disabled = true;
   const before = segments.map((s) => s.text);
@@ -630,10 +663,11 @@ async function proofread() {
   try {
     const total = Math.ceil(items.length / AI_BATCH);
     for (let b = 0; b < total; b++) {
-      setAiStatus(`AI 校稿中… ${b + 1} / ${total}`);
+      const progress = `AI 校稿中… ${b + 1} / ${total}`;
+      setAiStatus(progress);
       const batch = items.slice(b * AI_BATCH, (b + 1) * AI_BATCH);
       const context = items.slice(Math.max(0, b * AI_BATCH - AI_CONTEXT), b * AI_BATCH);
-      const fixed = await proofreadBatch(model, batch, context);
+      const fixed = await proofreadBatch(models, batch, context, (msg) => setAiStatus(`${progress}（${msg}）`));
       for (const it of batch) {
         let t = fixed.get(it.id);
         if (t === undefined || !acceptAiLine(it.text, t)) continue;

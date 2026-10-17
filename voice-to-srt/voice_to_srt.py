@@ -257,6 +257,14 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_MODELS = ["gemini-3.6-flash", "gemini-3.6-flash-lite", "gemini-3.8-flash"]  # 預設選項，依序優先
 AI_BATCH = 60    # 每次送出的字幕段數
 AI_CONTEXT = 5   # 附上前一批最後幾段當上下文
+AI_RETRY_CODES = {429, 500, 502, 503, 504}  # 忙碌、暫時性錯誤：等一下重試
+AI_RETRY_WAITS = (3, 8, 20)                  # 每次重試前等幾秒
+
+
+class GeminiError(RuntimeError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def gemini_request(key, path, body=None):
@@ -277,37 +285,63 @@ def gemini_request(key, path, body=None):
         except ValueError:
             msg = e.reason
         if e.code == 400 and "API key" in msg:
-            raise RuntimeError("Gemini API 金鑰無效，請檢查是否貼對。") from None
+            raise GeminiError("Gemini API 金鑰無效，請檢查是否貼對。", e.code) from None
         if e.code == 403:
-            raise RuntimeError(f"這組金鑰沒有權限使用 Gemini API：{msg}") from None
+            raise GeminiError(f"這組金鑰沒有權限使用 Gemini API：{msg}", e.code) from None
         if e.code == 404:
-            raise RuntimeError(f"找不到 Gemini 模型：{msg}") from None
+            raise GeminiError(f"找不到 Gemini 模型：{msg}", e.code) from None
         if e.code == 429:
-            raise RuntimeError("Gemini 用量超過限制（免費額度或每分鐘上限），請稍後再試。") from None
-        raise RuntimeError(f"Gemini 錯誤 {e.code}：{msg}") from None
+            raise GeminiError("Gemini 用量超過限制（免費額度或每分鐘上限），請稍後再試。", e.code) from None
+        if e.code == 503:
+            raise GeminiError("Gemini 模型目前太忙（Google 端暫時性問題），請稍後再試。", e.code) from None
+        raise GeminiError(f"Gemini 錯誤 {e.code}：{msg}", e.code) from None
     except urllib.error.URLError as e:
-        raise RuntimeError(f"連不上 Gemini，請檢查網路：{e.reason}") from None
+        raise GeminiError(f"連不上 Gemini，請檢查網路：{e.reason}") from None
+    except TimeoutError:
+        raise GeminiError("Gemini 回應逾時", 504) from None
 
 
-def resolve_ai_model(key, wanted, log=print):
-    """確認模型能用；不能用時依 AI_MODELS 順序換一個可用的。"""
-    try:
-        data = gemini_request(key, "models?pageSize=200")
-    except RuntimeError:
-        raise
+def gemini_generate(key, models, body, log=print, sleep=None):
+    """送出校稿請求。忙碌時等一下重試；一直忙就換 models 裡的下一個模型（會直接修改 models，後面的批次沿用）。"""
+    import time
+    sleep = sleep or time.sleep
+    while True:
+        model = models[0]
+        last = None
+        for attempt in range(len(AI_RETRY_WAITS) + 1):
+            try:
+                return gemini_request(key, f"models/{model}:generateContent", body)
+            except GeminiError as e:
+                if e.code not in AI_RETRY_CODES:
+                    raise
+                last = e
+                if attempt < len(AI_RETRY_WAITS):
+                    wait = AI_RETRY_WAITS[attempt]
+                    log(f"Gemini 忙碌（{e.code}），{wait} 秒後重試…")
+                    sleep(wait)
+        if len(models) > 1:
+            models.pop(0)
+            log(f"{model} 一直忙碌，改用 {models[0]}。")
+        else:
+            raise last
+
+
+def resolve_ai_models(key, wanted, log=print):
+    """回傳要依序嘗試的模型清單：先用選的模型，忙碌時再依 AI_MODELS 順序換。選的模型不能用就直接跳過。"""
+    data = gemini_request(key, "models?pageSize=200")
     names = [m["name"].split("/", 1)[-1] for m in data.get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
     names = [n for n in names if n.startswith("gemini")]
-    if not names or wanted in names:
-        return wanted
-    for m in AI_MODELS:
-        hit = next((n for n in names if n == m or n.startswith(m + "-")), None)
-        if hit:
-            log(f"模型 {wanted} 不能用，改用 {hit}。")
-            return hit
-    hit = next((n for n in names if "flash" in n and "lite" not in n), names[0])
-    log(f"模型 {wanted} 不能用，改用 {hit}。")
-    return hit
+    if not names:
+        return [wanted]
+    preferred = [next((n for n in names if n == m or n.startswith(m + "-")), None) for m in AI_MODELS]
+    preferred = [n for n in preferred if n]
+    if not preferred:
+        preferred = [next((n for n in names if "flash" in n and "lite" not in n), names[0])]
+    if wanted in names:
+        return [wanted] + [n for n in preferred if n != wanted]
+    log(f"模型 {wanted} 不能用，改用 {preferred[0]}。")
+    return preferred
 
 
 def ai_prompt(topic, keywords):
@@ -332,7 +366,7 @@ def accept_ai_line(orig, fixed):
     return bool(fixed) and len(orig) * 0.5 <= len(fixed) <= len(orig) * 1.6 + 4
 
 
-def ai_proofread(texts, key, model, topic="", keywords=(), log=print, postprocess=lambda t: t):
+def ai_proofread(texts, key, models, topic="", keywords=(), log=print, postprocess=lambda t: t):
     """回傳 (校稿後的文字清單, 修改清單 [(序號, 原文, 新文)])。失敗時拋出例外，已完成的批次寫在 e.partial。"""
     system = ai_prompt(topic, list(keywords))
     out = list(texts)
@@ -347,7 +381,7 @@ def ai_proofread(texts, key, model, topic="", keywords=(), log=print, postproces
             if context:
                 prompt += "上下文（不用輸出）：\n" + "\n".join(context) + "\n\n"
             prompt += "請校對以下字幕（格式：編號|文字）：\n" + "\n".join(f"{i + 1}|{texts[i]}" for i in range(lo, hi))
-            data = gemini_request(key, f"models/{model}:generateContent", {
+            data = gemini_generate(key, models, {
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
@@ -360,7 +394,7 @@ def ai_proofread(texts, key, model, topic="", keywords=(), log=print, postproces
                                   "required": ["id", "text"]},
                     },
                 },
-            })
+            }, log)
             cands = data.get("candidates") or []
             if not cands:
                 raise RuntimeError("Gemini 沒有回傳結果")
@@ -497,8 +531,8 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
         texts = [t for _, _, t in items]
         postprocess = lambda t: phonetic_fix(apply_corrections(convert(t), pairs), terms)
         try:
-            model = resolve_ai_model(ai["key"], ai.get("model") or AI_MODELS[0], log)
-            new, changes = ai_proofread(texts, ai["key"], model, ai.get("topic", ""), keyword_list, log, postprocess)
+            models = resolve_ai_models(ai["key"], ai.get("model") or AI_MODELS[0], log)
+            new, changes = ai_proofread(texts, ai["key"], models, ai.get("topic", ""), keyword_list, log, postprocess)
         except RuntimeError as e:
             new, changes = getattr(e, "partial", (texts, []))
             msg = str(e).rstrip("。")
