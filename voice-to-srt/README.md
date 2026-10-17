@@ -60,7 +60,7 @@ python voice_to_srt.py a.mp3 b.mp3 c.mp3                # 一次轉多個
 线粒体=粒線體       ← 有「=」：自動更正
 ```
 
-可以直接往 `biology.txt` 加詞，或另存一份（例如 `chemistry.txt`）當新的詞庫，電腦版會自動出現在選單裡。
+可以直接往 `biology.txt` 加詞，或另存一份（例如 `physics.txt`）當新的詞庫，電腦版會自動出現在選單裡。
 命令列用 `-g biology` 或 `-g 詞庫檔路徑`：
 
 ```bash
