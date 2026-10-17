@@ -28,6 +28,9 @@ MEDIA_TYPES = [
     ("音訊/影片", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus *.wma *.mp4 *.mkv *.mov *.avi *.webm"),
     ("所有檔案", "*.*"),
 ]
+# 明顯不是音訊／影片的副檔名，選到時直接擋下
+NOT_MEDIA = {".txt", ".srt", ".vtt", ".json", ".md", ".csv", ".doc", ".docx", ".pdf", ".ppt", ".pptx",
+             ".xls", ".xlsx", ".py", ".bat", ".sh", ".zip", ".rar", ".7z", ".jpg", ".jpeg", ".png", ".gif"}
 
 
 def format_timestamp(seconds):
@@ -217,6 +220,36 @@ def is_hallucination(seg, prev_text):
     return bool(prev_text) and seg.text.strip() == prev_text
 
 
+def decode_audio(path, sampling_rate=16000):
+    """把音訊／影片解碼成 16kHz 單聲道 float32。
+
+    faster-whisper 內建的解碼用了新版 PyAV 已移除的參數（metadata_errors），
+    所以自己解碼，再把聲音資料交給模型。
+    """
+    import gc
+    import io
+    import av
+    import numpy as np
+    from faster_whisper.audio import _group_frames, _ignore_invalid_frames, _resample_frames
+
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=sampling_rate)
+    raw = io.BytesIO()
+    try:
+        container = av.open(path, mode="r")
+    except Exception as e:
+        raise RuntimeError(f"無法開啟這個檔案：{os.path.basename(path)}（{e}）") from e
+    with container:
+        if not container.streams.audio:
+            raise RuntimeError(f"這個檔案沒有聲音：{os.path.basename(path)}")
+        frames = _ignore_invalid_frames(container.decode(audio=0))
+        frames = _resample_frames(_group_frames(frames, 500000), resampler)
+        for frame in frames:
+            raw.write(frame.to_ndarray())
+    del resampler
+    gc.collect()
+    return np.frombuffer(raw.getbuffer(), dtype=np.int16).astype(np.float32) / 32768.0
+
+
 _model_cache = {}
 
 
@@ -237,6 +270,13 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
                       max_chars=0, output=None, log=print, progress=None, stop_event=None,
                       keywords="", corrections="", glossary=None, phonetic=True):
     """轉換單一檔案，回傳輸出的 srt 路徑。"""
+    if os.path.splitext(path)[1].lower() in NOT_MEDIA:
+        raise RuntimeError(f"這不是音訊或影片檔：{os.path.basename(path)}")
+    log(f"讀取聲音：{os.path.basename(path)}")
+    audio = decode_audio(path)
+    if audio.size == 0:
+        raise RuntimeError(f"讀不到聲音：{os.path.basename(path)}")
+
     log(f"載入模型 {model_name}（第一次使用會自動下載，請稍候）…")
     model = load_model(model_name)
     convert = make_converter(traditional)
@@ -244,11 +284,11 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
     keyword_list = [k.strip() for k in re.split(r"[,，、\n]", keywords or "") if k.strip()]
     if isinstance(glossary, str):
         glossary = [glossary]
-    for path in glossary or []:
-        g_keywords, g_corrections = read_glossary(path)
+    for g_path in glossary or []:
+        g_keywords, g_corrections = read_glossary(g_path)
         keyword_list += [k for k in g_keywords if k not in keyword_list]
         corrections = g_corrections + "\n" + (corrections or "")
-        log(f"使用詞庫：{os.path.basename(path)}")
+        log(f"使用詞庫：{os.path.basename(g_path)}")
 
     # 長的錯字先換，避免「淋巴細胞」被「細胞」之類的短規則先換掉
     pairs = sorted(parse_corrections(corrections), key=lambda p: -len(p[0]))
@@ -268,7 +308,7 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
         used.append(k)
         total += len(k) + 1
     if len(used) < len(keyword_list):
-        log(f"提示：關鍵字太多，只用了前 {len(used)} 個（其餘靠自動更正）。")
+        log(f"關鍵字共 {len(keyword_list)} 個：前 {len(used)} 個用來提示模型，全部都會用在讀音比對和自動更正。")
     keywords = "、".join(used)
     prompt_parts = []
     if keywords:
@@ -279,7 +319,7 @@ def transcribe_to_srt(path, model_name="small", language=None, traditional=False
 
     log(f"開始辨識：{os.path.basename(path)}")
     segments, info = model.transcribe(
-        path,
+        audio,
         language=language,
         vad_filter=True,
         initial_prompt=prompt,
@@ -396,10 +436,17 @@ def run_gui():
     listbox.pack(fill="x", pady=4)
 
     def add_files():
+        skipped = []
         for p in filedialog.askopenfilenames(title="選擇音訊或影片", filetypes=MEDIA_TYPES):
+            if os.path.splitext(p)[1].lower() in NOT_MEDIA:
+                skipped.append(os.path.basename(p))
+                continue
             if p not in files:
                 files.append(p)
                 listbox.insert("end", p)
+        if skipped:
+            messagebox.showwarning("略過", "這些不是音訊或影片檔，已略過：\n" + "\n".join(skipped)
+                                   + "\n\n詞庫請用下方「專業詞庫」勾選，不用加到這裡。")
 
     def clear_files():
         files.clear()
@@ -509,20 +556,27 @@ def run_gui():
         root.after(0, lambda: progress.configure(value=v))
 
     def worker(job_files, model, lang, trad, max_chars, keywords, corrections, glossary):
+        failed = []
         try:
             for i, path in enumerate(job_files, 1):
                 if stop_event.is_set():
                     break
                 log(f"── ({i}/{len(job_files)}) ──")
                 set_progress(0)
-                transcribe_to_srt(path, model, lang, trad, max_chars,
-                                  log=log, progress=set_progress, stop_event=stop_event,
-                                  keywords=keywords, corrections=corrections, glossary=glossary)
-            if not stop_event.is_set():
+                try:
+                    transcribe_to_srt(path, model, lang, trad, max_chars,
+                                      log=log, progress=set_progress, stop_event=stop_event,
+                                      keywords=keywords, corrections=corrections, glossary=glossary)
+                except Exception as e:  # 一個檔案失敗，繼續轉下一個
+                    log(f"錯誤：{e}")
+                    failed.append(f"{os.path.basename(path)}：{e}")
+            if stop_event.is_set():
+                pass
+            elif failed:
+                msg = "有些檔案沒有轉成功：\n\n" + "\n".join(failed)
+                root.after(0, lambda: messagebox.showwarning("部分失敗", msg))
+            else:
                 root.after(0, lambda: messagebox.showinfo("完成", "全部轉換完成！SRT 已存在原檔案旁邊。"))
-        except Exception as e:
-            log(f"錯誤：{e}")
-            root.after(0, lambda: messagebox.showerror("錯誤", str(e)))
         finally:
             root.after(0, lambda: (start_btn.configure(state="normal"), stop_btn.configure(state="disabled")))
 
